@@ -1,6 +1,6 @@
 # Design — reliable-agent-actions (working name)
 
-Status: **DESIGN APPROVED** by the author (2026-11-09, revision 6; earlier: fourth independent review: approve with comments — see §14).
+Status: **DESIGN APPROVED** by the author (2026-11-09, revision 6; earlier: fourth independent review: approve with comments — see §14). Revision 7 (2026-11-11): storage-contract refinements found while implementing week 2, see §14.
 No implementation code until the author approves. Properties not yet covered by an executed test are **argued, not
 verified**. Numbers marked ASSUMPTION need the author's confirmation. Facts about other projects: `docs/research/*.md`
 (desk research of 2026-11-09, re-verify before publishing). Name `reliable-agent-actions`, module prefix `raa-`, Maven
@@ -212,14 +212,16 @@ public interface ActionJournal {
     ClaimResult claim(ClaimRequest request, ClaimDecider decider);  // FOR UPDATE + decider + apply, one transaction
     RecordResult recordSuccess(byte[] keyHash, int attempt, String resultText);
     //   APPLIED | SUPERSEDED (a newer attempt exists) | ALREADY_SUCCEEDED(row) (e.g. resolved earlier by lookup)
+    //   | ALREADY_RESOLVED (failure only) | MISSING; carries the row and the state before the write
     RecordResult recordFailure(byte[] keyHash, int attempt, FailureKind kind, String error);
     boolean markUnknownIfLeaseExpired(byte[] keyHash, int attempt, String reason);
     //   WHERE attempt = ? AND state = 'EXECUTING' AND lease_until < clock_timestamp(); sets resolve_after = clock_timestamp()
     int renewLeases(String owner, Collection<KeyAttempt> inFlight, Duration lease);      // per (key, attempt)
-    List<ActionRecord> takeReconcileBatch(String reconcilerOwner, Duration hold, int limit); // short tx, SKIP LOCKED
-    boolean resolve(byte[] keyHash, int attempt, Resolution resolution);  // WHERE attempt = ? AND state = 'UNKNOWN'
-    Optional<CallRecord> findByProviderCallId(String providerCallId);                    // via call history table
-    int deleteTerminalOlderThan(Duration retention, int batchSize);
+    List<ActionRecord> takeReconcileBatch(Duration hold, int limit);                      // short tx, SKIP LOCKED
+    boolean resolve(byte[] keyHash, int attempt, Resolution resolution);  // WHERE attempt = ? AND state = <source>
+    //   Applied(text) | NotApplied | LookupUnreachable(backoff) | Escalate(reason): source UNKNOWN; Abandon(reason): FAILED
+    Optional<CallRecord> findByProviderCallId(byte[] scopeHash, String providerCallId);   // via call history table
+    int deleteTerminalOlderThan(Duration retention, int batchSize);                      // week 7, with ActionAdmin
 }
 
 // ---- raa-langchain4j
@@ -320,8 +322,9 @@ again after <time> to get the outcome"; `InProgressElsewhere` → "already in pr
 
 **Reconciler** (`runOnce`, every 15 s, safe on many processes):
 1. `takeReconcileBatch`: one short transaction — `SELECT … FOR UPDATE SKIP LOCKED LIMIT n` of rows that are
-   `EXECUTING` with expired lease, `UNKNOWN`/`FAILED` with `coalesce(resolve_after, '-infinity') <= clock_timestamp()`
-   (every transition into `UNKNOWN`/`FAILED` also sets `resolve_after = clock_timestamp()`), or past deadline; sets
+   `EXECUTING` with expired lease, `UNKNOWN`, or `FAILED` at/after the deadline (a `FAILED` row before its deadline
+   needs nothing from the reconciler), each with `coalesce(resolve_after, '-infinity') <= clock_timestamp()`
+   (every transition into `UNKNOWN`/`FAILED` also sets `resolve_after = clock_timestamp()`); sets
    `resolve_after = clock_timestamp() + hold` (a reconciler lease); commits. No lock is held during lookups.
 2. Per row, outside any transaction: expired `EXECUTING` → `markUnknownIfLeaseExpired`; `UNKNOWN` with lookup and
    `maxEffectDuration` passed → lookup → CAS `resolve` (`SUCCEEDED` / `FAILED` / backoff
@@ -378,9 +381,11 @@ create index raa_action_terminal      on raa_action (updated_at)    where state 
 ```
 
 Claim transaction (READ COMMITTED; `Connection.setNetworkTimeout` and statement timeout from the remaining
-`claimTimeout`): `INSERT … ON CONFLICT (key_hash) DO NOTHING RETURNING …`;
-if no row returned, `SELECT … FOR UPDATE`; if that also returns nothing (deleted by retention in between), repeat at
-most 3 times. Then the decision table; call-id row inserted (`ON CONFLICT DO NOTHING`) in the same transaction.
+`claimTimeout`): `SELECT … FOR UPDATE`, then `clock_timestamp()`, then the decision table; with no row the decider
+must start attempt 1, inserted with `INSERT … ON CONFLICT (key_hash) DO NOTHING RETURNING …`; if a concurrent claim
+inserted first (nothing returned) or the row was deleted in between, lock and decide again, at most 3 rounds. The
+call-id row is written in the same transaction: inserted if new (`ON CONFLICT DO NOTHING`), its attempt updated only
+when this call starts an attempt (so it always names the latest attempt *this* call started).
 Retention deletes `SUCCEEDED`/`ABANDONED` older than 7 days (default) in batches of 1 000; `ESCALATED`, `UNKNOWN`,
 `EXECUTING` are never deleted automatically.
 
@@ -531,9 +536,14 @@ server wrapper, strict mode, optional local-transaction mode (journal row and a 
 | Framework API churn | adapter breaks | public APIs only, floor+latest CI matrix, weekly scheduled build |
 | Schedule (8–12 h/week) | v0.1 slips | stage gates; week 3 alone is a demonstrable result |
 
-## 13. Verified vs argued (as of 2026-11-09)
+## 13. Verified vs argued (as of 2026-11-11)
 
-* Verified: nothing about this library — no code exists.
+* Verified by executed tests (`./gradlew build`, PostgreSQL 14 and 18): the §6 decision table per row and policy;
+  key canonicalization; policy validation; `raa-postgres` passes `raa-journal-tck` (claim locking and re-decision,
+  CAS fencing of record writes, late success of the same attempt, lease renewal predicates, reconcile batch
+  selection and hold, resolve CAS, call history); Q2 at storage level (64 concurrent claims in two journals → one
+  attempt; the two-JVM variant waits for the week-3 harness); claim runs at READ COMMITTED.
+* Not yet verified: everything that needs the runner, the reconciler loop or the process harness (Q1, Q1p, Q3–Q7).
 * Desk research (not re-verified by the author): framework signatures and memory ordering
   (`docs/research/framework-integration-surface.md`), competitor behavior (`docs/research/*.md`).
 * Argued: every guarantee in §1/§2 until the §9 tests exist and pass.
@@ -574,3 +584,11 @@ tests listed in §9; module prefix `raa-` (OQ1). Revision 5 changes were self-ch
 Revision 6 (author decisions, 2026-11-09, self-checked): storage contract moved out of core into the published
 `raa-storage-api` (core depends on it transitively, `raa-postgres` depends on it only — core and storage do not know
 each other); PostgreSQL floor 14; namespace `io.github.oleksii-fenin`; `raa-bom`; module principle (loosely coupled, dependencies point to contracts) in §4.
+
+Revision 7 (2026-11-11, implementation of roadmap week 2, self-checked plus tests): `findByProviderCallId` takes the
+scope hash (the call history key is `(scope_hash, provider_call_id)`); `takeReconcileBatch` loses the unused owner
+argument and takes `FAILED` rows only at/after the deadline; `Resolution` variants and `RecordResult` outcomes
+(`ALREADY_RESOLVED`, `MISSING`, state before the write, needed for `raa.late_result_corrected`) spelled out; the claim
+locks first and lets the decider decide row 1, retrying after a lost insert race; the call-id row updates its attempt
+only when that call starts one; `JournalException` is the single storage-failure type; `markUnknownIfLeaseExpired` and lease renewal lock the rows first and then read `clock_timestamp()` (a time read before a lock wait is not re-checked when the holder did not change the row — found by the independent review, covered by a regression test); claim and record timeouts (Q6) remain week 6; `ActionAdmin` and retention
+stay in week 7 as planned.
