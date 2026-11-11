@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Build with the JDK 25 toolchain (bytecode --release 17), run the tests on each supported user JDK.
+    name: build (tests on JDK ${{ matrix.test-java }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        test-java: ['17', '21', '25']
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          # The last version becomes JAVA_HOME (runs Gradle); every version is exported as JAVA_HOME_<v>_X64.
+          java-version: |
+            ${{ matrix.test-java }}
+            25
+      - uses: gradle/actions/setup-gradle@v5
+      - name: Build and test
+        run: >
+          ./gradlew build
+          -PtestJavaVersion=${{ matrix.test-java }}
+          -Porg.gradle.java.installations.fromEnv=JAVA_HOME_${{ matrix.test-java }}_X64,JAVA_HOME_25_X64
+          -Porg.gradle.java.installations.auto-download=false
