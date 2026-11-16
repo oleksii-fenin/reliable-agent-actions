@@ -1,6 +1,6 @@
 # Design — reliable-agent-actions (working name)
 
-Status: **DESIGN APPROVED** by the author (2026-11-09, revision 6; earlier: fourth independent review: approve with comments — see §14). Revision 7 (2026-11-11): storage-contract refinements found while implementing week 2, see §14.
+Status: **DESIGN APPROVED** by the author (2026-11-09, revision 6; earlier: fourth independent review: approve with comments — see §14). Revision 7 (2026-11-11): storage-contract refinements found while implementing week 2, see §14. Revision 8 (2026-11-12): runtime of week 3, see §14.
 No implementation code until the author approves. Properties not yet covered by an executed test are **argued, not
 verified**. Numbers marked ASSUMPTION need the author's confirmation. Facts about other projects: `docs/research/*.md`
 (desk research of 2026-11-09, re-verify before publishing). Name `reliable-agent-actions`, module prefix `raa-`, Maven
@@ -129,7 +129,9 @@ public record ActionKey(String scope, String name, List<String> businessParts) {
     // stable across retries with the same arguments; changes only when a definitely failed action is retried
     // with corrected arguments (so a downstream never sees one key with two parameter sets)
 }
-public record ToolCall(String toolName, String argumentsJson, String providerCallId /*nullable*/,
+public record ToolCall(String toolName, String argumentsJson /*display only, never hashed*/,
+                       Map<String, ?> arguments /*parsed value tree built by the adapter, ADR-0003*/,
+                       String providerCallId /*nullable*/,
                        String scope /*memory or conversation id; nullable here, but KeyStrategy must yield one*/) {}
 
 @FunctionalInterface public interface KeyStrategy { ActionKey keyFor(ToolCall call, Arguments args); }
@@ -592,3 +594,16 @@ argument and takes `FAILED` rows only at/after the deadline; `Resolution` varian
 locks first and lets the decider decide row 1, retrying after a lost insert race; the call-id row updates its attempt
 only when that call starts one; `JournalException` is the single storage-failure type; `markUnknownIfLeaseExpired` and lease renewal lock the rows first and then read `clock_timestamp()` (a time read before a lock wait is not re-checked when the holder did not change the row — found by the independent review, covered by a regression test); claim and record timeouts (Q6) remain week 6; `ActionAdmin` and retention
 stay in week 7 as planned.
+
+Revision 8 (2026-11-12, implementation of roadmap week 3 day 1, self-checked plus tests): argument parsing belongs to
+the adapter and hashing to core (ADR-0003, accepted 2026-11-11), so `ToolCall` carries the parsed `arguments` tree.
+`ActionRunner.run` rejects tools declared `none()` (read-only tools are called directly) and tools without a policy.
+A key strategy that cannot read the arguments ends the call as `Failed("invalid arguments", retryable)` before any
+claim. An `INDETERMINATE` error of an `AT_MOST_ONCE` tool without a lookup is escalated at once (rows 10/11 leave no
+other outcome). The record retry doubles as the read-back: a retried `recordSuccess` of a landed write reports
+`ALREADY_SUCCEEDED`. Until OQ8 is decided, every effect counts as started for the `FailureClassifier`, so only
+`ActionRejectedException` is `DEFINITE` by default. `claimTimeout` and telemetry stay in week 6. After the
+independent review of the same day: an interrupt during a lookup writes nothing and returns `Unknown(ASK_LATER)`
+(it is not an unreachable downstream); NUL characters are replaced by U+FFFD in recorded text (PostgreSQL rejects
+them on every retry); numbers whose scale overflows are invalid arguments; the runner logs a warning when an attempt
+starts while the lease renewer was never started. Open: OQ9 (callers do not honor the lookup backoff).

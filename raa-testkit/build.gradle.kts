@@ -6,4 +6,6 @@ description = "Test kit for reliable-agent-actions: fault points, a fake downstr
 
 dependencies {
     api(project(":raa-core"))
+
+    testImplementation(project(":raa-journal-tck"))
 }

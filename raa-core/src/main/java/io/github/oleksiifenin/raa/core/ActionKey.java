@@ -1,16 +1,7 @@
 package io.github.oleksiifenin.raa.core;
 
-import java.io.ByteArrayOutputStream;
 import java.math.BigDecimal;
 import java.math.BigInteger;
-import java.nio.ByteBuffer;
-import java.nio.CharBuffer;
-import java.nio.charset.CharacterCodingException;
-import java.nio.charset.CharsetEncoder;
-import java.nio.charset.CodingErrorAction;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
@@ -78,13 +69,13 @@ public record ActionKey(String scope, String name, List<String> businessParts) {
      * @return a new 32-byte array
      */
     public byte[] hash() {
-        ByteArrayOutputStream encoded = new ByteArrayOutputStream();
-        writeString(encoded, KEY_TAG);
-        writeString(encoded, scope);
-        writeString(encoded, name);
-        writeInt(encoded, businessParts.size());
-        businessParts.forEach(part -> writeString(encoded, part));
-        return sha256(encoded.toByteArray());
+        CanonicalEncoder encoded = new CanonicalEncoder()
+                .writeString(KEY_TAG)
+                .writeString(scope)
+                .writeString(name)
+                .writeInt(businessParts.size());
+        businessParts.forEach(encoded::writeString);
+        return encoded.sha256();
     }
 
     /**
@@ -93,10 +84,7 @@ public record ActionKey(String scope, String name, List<String> businessParts) {
      * @return a new 32-byte array
      */
     public byte[] scopeHash() {
-        ByteArrayOutputStream encoded = new ByteArrayOutputStream();
-        writeString(encoded, SCOPE_TAG);
-        writeString(encoded, scope);
-        return sha256(encoded.toByteArray());
+        return new CanonicalEncoder().writeString(SCOPE_TAG).writeString(scope).sha256();
     }
 
     /**
@@ -112,11 +100,8 @@ public record ActionKey(String scope, String name, List<String> businessParts) {
         if (materialArgsHash.length != SHA_256_LENGTH) {
             throw new IllegalArgumentException("materialArgsHash must be 32 bytes, got " + materialArgsHash.length);
         }
-        ByteArrayOutputStream input = new ByteArrayOutputStream();
-        input.writeBytes(hash());
-        input.writeBytes(materialArgsHash);
-        return IDEMPOTENCY_KEY_PREFIX
-                + Base64.getUrlEncoder().withoutPadding().encodeToString(sha256(input.toByteArray()));
+        byte[] digest = new CanonicalEncoder().writeBytes(hash()).writeBytes(materialArgsHash).sha256();
+        return IDEMPOTENCY_KEY_PREFIX + Base64.getUrlEncoder().withoutPadding().encodeToString(digest);
     }
 
     private static String canonicalText(Object value) {
@@ -149,38 +134,6 @@ public record ActionKey(String scope, String name, List<String> businessParts) {
     }
 
     private static void requireEncodable(String value) {
-        utf8(value);
-    }
-
-    private static byte[] utf8(String value) {
-        CharsetEncoder encoder = StandardCharsets.UTF_8.newEncoder()
-                .onMalformedInput(CodingErrorAction.REPORT)
-                .onUnmappableCharacter(CodingErrorAction.REPORT);
-        try {
-            ByteBuffer buffer = encoder.encode(CharBuffer.wrap(value));
-            byte[] bytes = new byte[buffer.remaining()];
-            buffer.get(bytes);
-            return bytes;
-        } catch (CharacterCodingException e) {
-            throw new IllegalArgumentException("key component is not valid UTF-16 text (unpaired surrogate)", e);
-        }
-    }
-
-    private static void writeString(ByteArrayOutputStream out, String value) {
-        byte[] bytes = utf8(value);
-        writeInt(out, bytes.length);
-        out.writeBytes(bytes);
-    }
-
-    private static void writeInt(ByteArrayOutputStream out, int value) {
-        out.writeBytes(ByteBuffer.allocate(Integer.BYTES).putInt(value).array());
-    }
-
-    private static byte[] sha256(byte[] input) {
-        try {
-            return MessageDigest.getInstance("SHA-256").digest(input);
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("SHA-256 is required on every Java platform", e);
-        }
+        CanonicalEncoder.utf8(value);
     }
 }

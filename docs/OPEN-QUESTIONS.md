@@ -1,6 +1,6 @@
 # Open questions — decisions for the author
 
-Labels OQ1–OQ7 (not to be confused with quality scenarios Q1–Q7 in DESIGN). Each item: options, recommendation,
+Labels OQ1–OQ9 (not to be confused with quality scenarios Q1–Q7 in DESIGN). Each item: options, recommendation,
 why, what it blocks. Decide before implementation week 1 unless noted.
 
 ## OQ1. Project name — **DECIDED 2026-11-09: `reliable-agent-actions`**
@@ -80,3 +80,32 @@ turn out to be Spring-first, swap: Spring AI in week 5 instead of memory repair.
 open memory-repair PR #4820 and quarkus-langchain4j #2744 ("tools are expected to be idempotent"), and offer the adapter
 as a community module. Earlier = talk without evidence; later = risk that someone else fills the gap. Every public post
 only after your "ок" on the exact text.
+
+## OQ8. How a tool opts into the side-effect marker — **open (found 2026-11-12 while implementing the runner)**
+
+§5 says exceptions before `ActionContext.beforeSideEffect()` are `DEFINITE` by default. A tool that never calls the
+marker would then have every exception, including a downstream timeout, classified as `DEFINITE` → `FAILED` → a new
+attempt: a possible duplicate, and for `AT_MOST_ONCE` a broken guarantee. The runner cannot tell "threw before the
+marker" from "does not use the marker" without a declaration.
+
+* (a) **Recommended.** Opt-in on the policy (for example `usesSideEffectMarker()`); without it every effect counts as
+  started, as implemented now.
+* (b) Opt-in per call: the tool calls `ActionContext.current().declareSideEffectMarker()` first thing.
+* (c) Drop the marker; tools signal "not applied" only with `ActionRejectedException` or their own classifier.
+
+Current behavior (safe default): every effect counts as started; `beforeSideEffect()` has no effect yet. Blocks:
+nothing in week 3; must be decided before the README describes the marker.
+
+## OQ9. Do callers honor the lookup backoff? — **open (found 2026-11-12 by the independent review)**
+
+Row 8 asks for a lookup whenever the lookup window is open; it does not look at `resolve_after`. The backoff written
+after an unreachable lookup (`min(2^n × 15 s, 10 min)`) therefore slows down only the reconciler. A model that calls a
+`RECONCILABLE` tool 8 times in a row while the downstream is down escalates the action within seconds, and the
+`ASK_LATER` text "call again after <time>" is not enforced.
+
+* (a) **Recommended.** Row 8 also requires `resolve_after <= clock_timestamp()`; inside the backoff,
+  `IDEMPOTENT_DOWNSTREAM`/`AT_LEAST_ONCE` continue at row 10 (as for Unreachable) and the others return
+  `Unknown(ASK_LATER)` without a lookup. A change of the decision table: DESIGN §6 row 8 and its tests.
+* (b) Keep row 8; document that only the reconciler honors the backoff and that eight caller lookups escalate.
+
+Blocks: nothing on day 2; decide before the kill matrix covers `RECONCILABLE`.
