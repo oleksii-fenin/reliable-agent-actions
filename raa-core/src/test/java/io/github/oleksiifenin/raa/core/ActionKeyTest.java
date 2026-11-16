@@ -19,6 +19,43 @@ class ActionKeyTest {
 
     private enum Region { EU }
 
+    // ---- key text (ADR-0004)
+
+    @Test
+    void toText_isTheDocumentedLengthPrefixedForm() {
+        assertThat(ActionKey.of("conversation-1", "refund", "order-42").toText())
+                .isEqualTo("raa-key/v1;14:conversation-1;6:refund;8:order-42");
+        assertThat(ActionKey.of("c", "send").toText()).isEqualTo("raa-key/v1;1:c;4:send");
+    }
+
+    @Test
+    void parse_readsBackEveryKey_whateverItsComponentsContain() {
+        List<ActionKey> keys = List.of(
+                ActionKey.of("c", "send"),
+                ActionKey.of("c;1:x", "a:b;c", ";", ":", "", "12:", "raa-key/v1;"),
+                ActionKey.of("Zürich", "refund", "😀 emoji", "line\nbreak", "tab\t"),
+                ActionKey.of("conversation-1", "refund", 42, new BigDecimal("10.50"), Region.EU));
+
+        for (ActionKey key : keys) {
+            ActionKey parsed = ActionKey.parse(key.toText());
+            assertThat(parsed).isEqualTo(key);
+            assertThat(parsed.hash()).isEqualTo(key.hash());
+        }
+    }
+
+    @Test
+    void parse_rejectsTextThatIsNotAKeyTextOfVersion1() {
+        List<String> malformed = List.of(
+                "", "raa-key/v2;1:c;4:send", "raa-key/v1", "raa-key/v1;1:c", "raa-key/v1;1:c;4:sen",
+                "raa-key/v1;1:c;4:sendX", "raa-key/v1;1:c;04:send", "raa-key/v1;1:c;-4:send", "raa-key/v1;1:c;x:send",
+                "raa-key/v1;1:c;4send", "raa-key/v1;1: ;4:send", "raa-key/v1;1:c;9999999999:send",
+                "raa-key/v1;1:c;4:send;1:\uD800");
+
+        for (String text : malformed) {
+            assertThatThrownBy(() -> ActionKey.parse(text)).as(text).isInstanceOf(IllegalArgumentException.class);
+        }
+    }
+
     @Test
     void hash_isSha256OverTheDocumentedLengthPrefixedEncoding() throws Exception {
         ActionKey key = ActionKey.of("conversation-1", "refund", "order-42", "Zürich");

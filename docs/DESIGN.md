@@ -1,6 +1,6 @@
 # Design — reliable-agent-actions (working name)
 
-Status: **DESIGN APPROVED** by the author (2026-11-09, revision 6; earlier: fourth independent review: approve with comments — see §14). Revision 7 (2026-11-11): storage-contract refinements found while implementing week 2, see §14. Revision 8 (2026-11-12): runtime of week 3; revision 9 (2026-11-16): OQ8 and OQ9 decided, see §14.
+Status: **DESIGN APPROVED** by the author (2026-11-09, revision 6; earlier: fourth independent review: approve with comments — see §14). Revision 7 (2026-11-11): storage-contract refinements found while implementing week 2, see §14. Revision 8 (2026-11-12): runtime of week 3; revision 9 (2026-11-16): OQ8 and OQ9 decided; revision 10 (2026-11-16): reconciler, kill matrix, ADR-0004, see §14.
 No implementation code until the author approves. Properties not yet covered by an executed test are **argued, not
 verified**. Numbers marked ASSUMPTION need the author's confirmation. Facts about other projects: `docs/research/*.md`
 (desk research of 2026-11-09, re-verify before publishing). Name `reliable-agent-actions`, module prefix `raa-`, Maven
@@ -175,7 +175,8 @@ public sealed interface LookupResult {
 public final class ReliableActions {
     public static Builder builder(ActionJournal journal);
     // Builder: tool(String toolName, ActionPolicy), lease(Duration = 30 s), inProgressWait(Duration = 2 s),
-    //          claimTimeout(Duration = 2.5 s), recordRetryBudget(Duration = 3 s), telemetry(ActionTelemetry).
+    //          claimTimeout(Duration = 2.5 s), recordRetryBudget(Duration = 3 s), telemetry(ActionTelemetry),
+    //          storeKeyText(boolean = false): key as reversible text in key_text, for reconciler lookups (ADR-0004).
     //          No clock setting: DB time only. Process owner id = random UUID per process start.
     public ActionRunner runner();
     public Reconciler reconciler();               // runOnce(); scheduled by the app (or the v0.2 starter)
@@ -340,6 +341,11 @@ again after <time> to get the outcome"; `InProgressElsewhere` → "already in pr
    `ABANDONED`), otherwise or on `Unreachable` → `ESCALATED`; `FAILED` → `ABANDONED`.
 4. Never executes an effect (ADR-0001). Consequence: an `IDEMPOTENT_DOWNSTREAM` action left `UNKNOWN` without a later
    call is `ESCALATED` at its deadline.
+5. Lookups need the action key, which the reconciler has only from `key_text` (ADR-0004, `storeKeyText`); a row without
+   usable key text is left to the next call and escalated at its deadline. Database time of a batch is
+   `resolve_after - hold` of its rows (the take sets `resolve_after = clock_timestamp() + hold`). As in row 11, an
+   `UNKNOWN` `AT_MOST_ONCE` row without a lookup is escalated at once; a lookup also waits for the lookup window after
+   the deadline (an attempt that may still land is not declared "not found").
 
 **Lease renewer.** Every `lease/2`: `UPDATE raa_action SET lease_until = clock_timestamp() + :lease
 WHERE (key_hash, attempt) IN (:inFlight) AND state = 'EXECUTING' AND lease_owner = :owner
@@ -543,14 +549,19 @@ server wrapper, strict mode, optional local-transaction mode (journal row and a 
 | Framework API churn | adapter breaks | public APIs only, floor+latest CI matrix, weekly scheduled build |
 | Schedule (8–12 h/week) | v0.1 slips | stage gates; week 3 alone is a demonstrable result |
 
-## 13. Verified vs argued (as of 2026-11-11)
+## 13. Verified vs argued (as of 2026-11-16)
 
 * Verified by executed tests (`./gradlew build`, PostgreSQL 14 and 18): the §6 decision table per row and policy;
   key canonicalization; policy validation; `raa-postgres` passes `raa-journal-tck` (claim locking and re-decision,
   CAS fencing of record writes, late success of the same attempt, lease renewal predicates, reconcile batch
   selection and hold, resolve CAS, call history); Q2 at storage level (64 concurrent claims in two journals → one
   attempt; the two-JVM variant waits for the week-3 harness); claim runs at READ COMMITTED.
-* Not yet verified: everything that needs the runner, the reconciler loop or the process harness (Q1, Q1p, Q3–Q7).
+* Verified since 2026-11-16 (stage 1 gate): the kill matrix of §9.1 in mode (a) — 4 policies × 4 fault points, child
+  JVMs killed with SIGKILL, resumed by a new call — matches the table, and the negative controls see the duplicate
+  (`KillMatrixTest`; a mutation of row 11 is caught by it); the runner per verdict and model-visible outcome; the
+  reconciler per step, including on PostgreSQL with database time (`PostgresReconcilerTest`).
+* Not yet verified: mode (b) (memory repair, week 5), the two-JVM Q2 variant, Q1p (pause), Q3–Q7 beyond the reference
+  timing in the runner test. The final model text is checked as the `ActionOutcome` until `OutcomeRenderer` (week 4).
 * Desk research (not re-verified by the author): framework signatures and memory ordering
   (`docs/research/framework-integration-surface.md`), competitor behavior (`docs/research/*.md`).
 * Argued: every guarantee in §1/§2 until the §9 tests exist and pass.
@@ -626,3 +637,16 @@ a lookup that could have found the effect); and the backoff is ignored when the 
 passed, or attempts exhausted for a retry-safe policy), so the last lookup before escalation still runs. The deadline
 and hold rules are implementation choices within decision (a), not part of its text. Row 9 still wins before the
 lookup window opens.
+
+Revision 10 (2026-11-16, roadmap week 3 day 2, stage 1 gate; author's decision on the reconciler lookup key, ADR-0004):
+`Reconciler.runOnce()` implements §6 Reconciler steps 1–4 plus step 5 (key text, database time from the batch,
+`AT_MOST_ONCE` without a lookup escalated at once, lookups wait for the window also after the deadline);
+`ActionKey.toText()`/`parse` and `ReliableActions.Builder.storeKeyText`; the lookup with timeout is shared by runner
+and reconciler (`TimedLookup`); a lookup's result text gets the same U+0000 replacement as an effect's. `raa-testkit`:
+`FaultPoint`, `FaultInjector`, `FakeDownstream`, `JvmProcess`; the kill matrix (`KillMatrixTest`, mode (a)) and its
+negative controls run in every `./gradlew build`, so on every CI job. The kill-matrix database is shared by its cells
+(one scope per cell; reconciler off); the reconciler test on PostgreSQL gets a database of its own. Independent review
+(Codex, request changes, fixed the same day): every kill is verified as SIGKILL (exit code 137, no outcome printed) and
+the row is checked in its crash state before the resume, so a child that finished on its own (for example an HTTP
+timeout while the response was held) fails the cell; external text in escalation reasons gets the U+0000 replacement;
+the PostgreSQL reconciler test no longer depends on scheduling (long lease, expired explicitly in database time).

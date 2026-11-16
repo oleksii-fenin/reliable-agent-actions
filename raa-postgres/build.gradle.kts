@@ -10,6 +10,7 @@ dependencies {
 
     testImplementation(project(":raa-journal-tck"))
     testImplementation(project(":raa-core"))
+    testImplementation(project(":raa-testkit"))
     testImplementation(libs.postgresql)
     testImplementation(libs.testcontainers.postgresql)
 }

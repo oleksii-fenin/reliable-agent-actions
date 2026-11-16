@@ -790,6 +790,17 @@ class ActionRunnerTest {
     }
 
     @Test
+    void indeterminateErrorWithANulCharacter_atMostOnce_isStillEscalatedInTheJournal() {
+        ActionRunner runner = runner(ActionPolicy.atMostOnce());
+
+        ActionOutcome outcome = runner.run(call("c1", "order-42", "10"), failing(new IOException("bad\u0000reply")));
+
+        assertThat(outcome).isInstanceOf(ActionOutcome.Escalated.class);
+        assertThat(row("c1").state()).isEqualTo(ActionState.ESCALATED);
+        assertThat(row("c1").lastError()).contains("bad\uFFFDreply");
+    }
+
+    @Test
     void resultWithNulCharacters_isRecordedWithReplacementCharacters_andReturnedUnchanged() {
         ActionRunner runner = runner(ActionPolicy.atMostOnce());
 

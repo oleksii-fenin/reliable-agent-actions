@@ -20,12 +20,15 @@ public final class ReliableActions {
 
     private final LeaseRenewer leaseRenewer;
     private final ActionRunner runner;
+    private final Reconciler reconciler;
 
     private ReliableActions(Builder builder) {
         String owner = UUID.randomUUID().toString(); // lease owner id of this wiring
         this.leaseRenewer = new LeaseRenewer(builder.journal, owner, builder.lease);
         this.runner = new ActionRunner(builder.journal, Map.copyOf(builder.policies), owner, builder.lease,
-                builder.inProgressWait, builder.recordRetryBudget, leaseRenewer);
+                builder.inProgressWait, builder.recordRetryBudget, leaseRenewer, builder.storeKeyText);
+        this.reconciler = new Reconciler(builder.journal, Map.copyOf(builder.policies), Reconciler.DEFAULT_HOLD,
+                Reconciler.DEFAULT_BATCH_SIZE);
     }
 
     /**
@@ -56,6 +59,16 @@ public final class ReliableActions {
         return leaseRenewer;
     }
 
+    /**
+     * Returns the reconciler; the application calls {@link Reconciler#runOnce()} periodically (every 15 seconds is
+     * the documented cadence), on any number of processes.
+     *
+     * @return the reconciler
+     */
+    public Reconciler reconciler() {
+        return reconciler;
+    }
+
     /** Collects the wiring; {@link #build()} validates every policy. */
     public static final class Builder {
 
@@ -64,6 +77,7 @@ public final class ReliableActions {
         private Duration lease = DEFAULT_LEASE;
         private Duration inProgressWait = DEFAULT_IN_PROGRESS_WAIT;
         private Duration recordRetryBudget = DEFAULT_RECORD_RETRY_BUDGET;
+        private boolean storeKeyText;
 
         private Builder(ActionJournal journal) {
             this.journal = Objects.requireNonNull(journal, "journal");
@@ -116,6 +130,19 @@ public final class ReliableActions {
          */
         public Builder recordRetryBudget(Duration recordRetryBudget) {
             this.recordRetryBudget = requirePositive(recordRetryBudget, "recordRetryBudget");
+            return this;
+        }
+
+        /**
+         * Stores the action key as readable text in the journal (ADR-0004); default {@code false}. Needed for the
+         * {@link Reconciler} to look up actions whose conversation does not resume. The text contains the business
+         * identifiers of the key (for example an order id or an e-mail address).
+         *
+         * @param storeKeyText whether to store key text
+         * @return this builder
+         */
+        public Builder storeKeyText(boolean storeKeyText) {
+            this.storeKeyText = storeKeyText;
             return this;
         }
 

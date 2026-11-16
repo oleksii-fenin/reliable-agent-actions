@@ -28,6 +28,7 @@ public record ActionKey(String scope, String name, List<String> businessParts) {
     private static final String KEY_TAG = "raa-action-key/v1";
     private static final String SCOPE_TAG = "raa-key-scope/v1";
     private static final String IDEMPOTENCY_KEY_PREFIX = "raa-";
+    private static final String TEXT_TAG = "raa-key/v1";
     private static final int SHA_256_LENGTH = 32;
 
     /** Validates the components and copies the part list. */
@@ -102,6 +103,69 @@ public record ActionKey(String scope, String name, List<String> businessParts) {
         }
         byte[] digest = new CanonicalEncoder().writeBytes(hash()).writeBytes(materialArgsHash).sha256();
         return IDEMPOTENCY_KEY_PREFIX + Base64.getUrlEncoder().withoutPadding().encodeToString(digest);
+    }
+
+    /**
+     * Returns the reversible text form stored in the journal's {@code key_text} when key text is enabled (ADR-0004):
+     * {@code raa-key/v1} followed by the scope, the name and every business part, each as {@code ;<length>:<text>}
+     * with the length in UTF-16 code units. {@link #parse(String)} reads it back.
+     *
+     * @return the text, for example {@code raa-key/v1;14:conversation-1;6:refund;8:order-42}
+     */
+    public String toText() {
+        StringBuilder text = new StringBuilder(TEXT_TAG);
+        appendComponent(text, scope);
+        appendComponent(text, name);
+        businessParts.forEach(part -> appendComponent(text, part));
+        return text.toString();
+    }
+
+    /**
+     * Reads a key written by {@link #toText()}.
+     *
+     * @param text the text
+     * @return the key
+     * @throws IllegalArgumentException if the text is not a key text of a known version
+     */
+    public static ActionKey parse(String text) {
+        Objects.requireNonNull(text, "text");
+        if (!text.startsWith(TEXT_TAG)) {
+            throw new IllegalArgumentException("not an action key text of version " + TEXT_TAG);
+        }
+        List<String> components = new ArrayList<>();
+        int position = TEXT_TAG.length();
+        while (position < text.length()) {
+            if (text.charAt(position) != ';') {
+                throw new IllegalArgumentException("malformed action key text at index " + position);
+            }
+            int colon = text.indexOf(':', position + 1);
+            if (colon < 0) {
+                throw new IllegalArgumentException("malformed action key text: missing length at index " + position);
+            }
+            int length = parseLength(text.substring(position + 1, colon));
+            int end = colon + 1 + length;
+            if (end > text.length() || end < 0) {
+                throw new IllegalArgumentException("malformed action key text: component past the end");
+            }
+            components.add(text.substring(colon + 1, end));
+            position = end;
+        }
+        if (components.size() < 2) {
+            throw new IllegalArgumentException("malformed action key text: scope and name are required");
+        }
+        return new ActionKey(components.get(0), components.get(1), components.subList(2, components.size()));
+    }
+
+    private static void appendComponent(StringBuilder text, String component) {
+        text.append(';').append(component.length()).append(':').append(component);
+    }
+
+    private static int parseLength(String digits) {
+        if (digits.isEmpty() || digits.length() > 9 || !digits.chars().allMatch(c -> c >= '0' && c <= '9')
+                || digits.length() > 1 && digits.charAt(0) == '0') {
+            throw new IllegalArgumentException("malformed action key text: bad length '" + digits + "'");
+        }
+        return Integer.parseInt(digits);
     }
 
     private static String canonicalText(Object value) {

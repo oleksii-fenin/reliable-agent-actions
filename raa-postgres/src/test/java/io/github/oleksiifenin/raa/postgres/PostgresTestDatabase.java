@@ -7,6 +7,8 @@ import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.List;
+import java.util.UUID;
 import javax.sql.DataSource;
 import org.postgresql.ds.PGSimpleDataSource;
 import org.testcontainers.postgresql.PostgreSQLContainer;
@@ -46,6 +48,36 @@ final class PostgresTestDatabase {
         dataSource.setUser(container.getUsername());
         dataSource.setPassword(container.getPassword());
         return dataSource;
+    }
+
+    /**
+     * Creates an empty database with the schema, for tests that must not see rows of other tests (the reconciler takes
+     * any row that needs it).
+     */
+    DataSource newDatabase() {
+        String name = "raa_" + UUID.randomUUID().toString().replace("-", "");
+        execute("create database " + name);
+        PGSimpleDataSource dataSource = new PGSimpleDataSource();
+        dataSource.setServerNames(new String[] {container.getHost()});
+        dataSource.setPortNumbers(new int[] {container.getMappedPort(PostgreSQLContainer.POSTGRESQL_PORT)});
+        dataSource.setDatabaseName(name);
+        dataSource.setUser(container.getUsername());
+        dataSource.setPassword(container.getPassword());
+        try (Connection connection = dataSource.getConnection(); Statement statement = connection.createStatement()) {
+            statement.execute(readSchema());
+        } catch (SQLException e) {
+            throw new IllegalStateException("could not create the schema in " + name, e);
+        }
+        return dataSource;
+    }
+
+    /**
+     * Returns what a child process needs to reach this database: the JDBC URL, the user and the password.
+     *
+     * @return three values, in that order
+     */
+    List<String> connectionArguments() {
+        return List.of(container.getJdbcUrl(), container.getUsername(), container.getPassword());
     }
 
     void execute(String sql) {

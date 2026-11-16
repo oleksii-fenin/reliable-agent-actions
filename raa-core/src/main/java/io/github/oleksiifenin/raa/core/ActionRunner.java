@@ -17,12 +17,7 @@ import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.function.Supplier;
 
 /**
@@ -41,7 +36,7 @@ public final class ActionRunner {
     /** Claims that do not start, wait or finish (lookup resolutions) before the runner gives up. */
     private static final int MAX_SETTLE_ROUNDS = 16;
     /** Consecutive unreachable lookups after which the outcome is escalated (docs/DESIGN.md §6, reconciler). */
-    private static final int MAX_UNREACHABLE_LOOKUPS = 8;
+    static final int MAX_UNREACHABLE_LOOKUPS = 8;
     private static final Duration LOOKUP_BACKOFF_BASE = Duration.ofSeconds(15);
     private static final Duration LOOKUP_BACKOFF_MAX = Duration.ofMinutes(10);
     private static final long FIRST_PAUSE_NANOS = TimeUnit.MILLISECONDS.toNanos(25);
@@ -55,16 +50,14 @@ public final class ActionRunner {
     private final Duration inProgressWait;
     private final Duration recordRetryBudget;
     private final LeaseRenewer leaseRenewer;
+    private final boolean storeKeyText;
     private final ArgumentsHasher hasher = new ArgumentsHasher();
-    private final ExecutorService lookupExecutor = Executors.newCachedThreadPool(runnable -> {
-        Thread thread = new Thread(runnable, "raa-outcome-lookup");
-        thread.setDaemon(true);
-        return thread;
-    });
+    private final TimedLookup timedLookup = new TimedLookup();
 
     ActionRunner(ActionJournal journal, Map<String, ActionPolicy> policies, String owner, Duration lease,
-            Duration inProgressWait, Duration recordRetryBudget, LeaseRenewer leaseRenewer) {
+            Duration inProgressWait, Duration recordRetryBudget, LeaseRenewer leaseRenewer, boolean storeKeyText) {
         this.journal = journal;
+        this.storeKeyText = storeKeyText;
         this.policies = policies;
         this.owner = owner;
         this.lease = lease;
@@ -109,10 +102,25 @@ public final class ActionRunner {
             // Nothing was claimed or performed; the model may correct the arguments.
             return new ActionOutcome.Failed("invalid arguments: " + message(e), true);
         }
-        ClaimRequest request = new ClaimRequest(key.hash(), key.scopeHash(), null, call.toolName(),
+        ClaimRequest request = new ClaimRequest(key.hash(), key.scopeHash(), keyText(key), call.toolName(),
                 journaled.journalName(), hashes.material(), hashes.all(), null, call.providerCallId(), owner, lease,
                 journaled.maxEffectDuration().orElseThrow(), journaled.deadline());
         return new Execution(journaled, tables.get(call.toolName()), key, request, effect).run();
+    }
+
+    /** The key text to store (ADR-0004), or {@code null} if disabled or not storable. */
+    private String keyText(ActionKey key) {
+        if (!storeKeyText) {
+            return null;
+        }
+        String text = key.toText();
+        if (text.indexOf('\u0000') >= 0) {
+            LOG.log(System.Logger.Level.WARNING, "the key of an action of tool {0} contains U+0000, which the journal"
+                    + " cannot store; it is stored without key text, so the reconciler cannot look it up",
+                    key.name());
+            return null;
+        }
+        return text;
     }
 
     /** The state of one {@link #run} call. */
@@ -270,7 +278,7 @@ public final class ActionRunner {
                 // Rows 10/11: nothing can resolve an unknown at-most-once outcome but an operator.
                 if (result != null && result.outcome() == RecordOutcome.APPLIED) {
                     try {
-                        journal.resolve(request.keyHash(), attempt, new Resolution.Escalate(reason));
+                        journal.resolve(request.keyHash(), attempt, new Resolution.Escalate(storable(reason)));
                     } catch (JournalException e) {
                         // The next claim or the reconciler escalates the UNKNOWN row instead.
                         LOG.log(System.Logger.Level.WARNING, "could not escalate an unknown outcome", e);
@@ -356,7 +364,7 @@ public final class ActionRunner {
             }
             Resolution resolution;
             if (result instanceof LookupResult.Found) {
-                resolution = new Resolution.Applied(((LookupResult.Found) result).resultText());
+                resolution = new Resolution.Applied(storable(((LookupResult.Found) result).resultText()));
                 resolvedByOwnLookup = true;
             } else if (result instanceof LookupResult.NotFound) {
                 resolution = policy instanceof AtMostOnce
@@ -364,7 +372,7 @@ public final class ActionRunner {
                                 + " action is never retried")
                         : new Resolution.NotApplied();
             } else {
-                String reason = ((LookupResult.Unreachable) result).reason();
+                String reason = storable(((LookupResult.Unreachable) result).reason()); // may be stored
                 int failures = row.lookupFailures() + 1;
                 resolution = failures >= MAX_UNREACHABLE_LOOKUPS
                         ? new Resolution.Escalate("the outcome lookup was unreachable " + failures + " times: " + reason)
@@ -382,21 +390,7 @@ public final class ActionRunner {
 
         /** Asks the downstream with the policy's timeout; {@code null} if this thread was interrupted meanwhile. */
         private LookupResult lookUp(OutcomeLookup lookup, String idempotencyKey) {
-            Duration timeout = policy.lookupTimeout();
-            Future<LookupResult> pending = lookupExecutor.submit(() -> lookup.lookup(key, idempotencyKey));
-            try {
-                LookupResult result = pending.get(timeout.toNanos(), TimeUnit.NANOSECONDS);
-                return result == null ? new LookupResult.Unreachable("the lookup returned no result") : result;
-            } catch (TimeoutException e) {
-                pending.cancel(true);
-                return new LookupResult.Unreachable("the lookup did not answer within " + timeout);
-            } catch (ExecutionException e) {
-                return new LookupResult.Unreachable("the lookup failed: " + message(e.getCause()));
-            } catch (InterruptedException e) {
-                pending.cancel(true);
-                Thread.currentThread().interrupt();
-                return null;
-            }
+            return timedLookup.lookUp(lookup, key, idempotencyKey, policy.lookupTimeout());
         }
 
         private ActionOutcome interruptedBeforeVerification() {

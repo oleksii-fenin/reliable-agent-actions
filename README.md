@@ -1,7 +1,8 @@
 # reliable-agent-actions
 
-> **Status: design, not implemented** (design approved 2026-11-09, implementation started). This README describes intended behavior.
-> No code is released.
+> **Status: implementation in progress, not released** (design approved 2026-11-09). Core, PostgreSQL journal,
+> reconciler and the process-kill test exist; the LangChain4j adapter does not yet. This README describes intended
+> behavior; see the verification status below the guarantees.
 > Working name — see [`docs/OPEN-QUESTIONS.md`](docs/OPEN-QUESTIONS.md).
 
 A small Java library that makes **side-effecting tool calls of AI agents effectively-once**. Your agent's
@@ -43,10 +44,23 @@ meaning, and an explicit rule for what to do when the outcome is unknown.
 | Opt-in repair of LangChain4j chat memory from the journal after a crash | Replay after the retention period (default 7 days) — the row is gone |
 | | Durability across a failover to an **asynchronous** replica that lost committed rows — use synchronous replication for the journal |
 | | Automatic completion without the agent: the library never re-runs a tool by itself; an unknown outcome nobody asks about again is escalated at its deadline |
+| | Unattended lookups without key text: the reconciler can look up only actions whose key is stored as text (`storeKeyText(true)`, which puts business identifiers such as order ids into the journal); otherwise the next call looks the outcome up, or it is escalated at its deadline ([ADR-0004](docs/adr/0004-reconciler-lookups-need-the-action-key.md)) |
 
 Every row on the left is to be backed by an automated test, including a test that **kills the JVM in the middle of a
 tool call**, one that **pauses** it past its lease, and negative controls proving the harness detects duplicates.
-Until those tests exist, these are design goals.
+
+**Verification status (2026-11-16, PostgreSQL 14 and 18, plain Java caller, no LLM yet):**
+
+* **Verified — process kill.** A child JVM is killed with SIGKILL at four points of a tool call (after the claim; effect
+  applied with the response held; response received but not recorded; recorded but not handed back) and a second JVM
+  calls again with a new tool-call id. For all four policies the effects applied, the final journal state and the final
+  outcome match the expected-outcome table ([`KillMatrixTest`](raa-postgres/src/test/java/io/github/oleksiifenin/raa/postgres/KillMatrixTest.java), DESIGN §9.1, mode (a)). Negative controls without
+  the library see the duplicate effect, so the harness can detect one.
+* **Verified — journal rules.** One live lease per key and fenced writes of stale attempts (journal TCK on PostgreSQL),
+  the recorded result on repeat and the conflict on changed arguments, unknown outcomes never retried silently,
+  deadlines and escalation, database time only (runner, reconciler and decision-table tests).
+* **Argued, not verified yet:** the pause past the lease (Q1p), chat-memory repair (mode (b)) and everything
+  LangChain4j-specific, failover behavior, overhead.
 
 ## Quick start (intended API)
 
