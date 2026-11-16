@@ -28,11 +28,12 @@ public abstract sealed class JournaledPolicy<P extends JournaledPolicy<P>> imple
             Set<String> freeTextArguments,
             FailureClassifier failureClassifier,
             OutcomeLookup lookup,
-            Duration lookupTimeout) {
+            Duration lookupTimeout,
+            boolean sideEffectMarker) {
 
         static Settings defaults(OutcomeLookup lookup) {
             return new Settings(null, null, DEFAULT_DEADLINE, DEFAULT_MAX_ATTEMPTS, Set.of(),
-                    FailureClassifier.standard(), lookup, DEFAULT_LOOKUP_TIMEOUT);
+                    FailureClassifier.standard(), lookup, DEFAULT_LOOKUP_TIMEOUT, false);
         }
     }
 
@@ -62,7 +63,8 @@ public abstract sealed class JournaledPolicy<P extends JournaledPolicy<P>> imple
         Objects.requireNonNull(keyStrategy, "keyStrategy");
         Settings s = settings;
         return withSettings(new Settings(keyStrategy, s.maxEffectDuration(), s.deadline(), s.maxAttempts(),
-                s.freeTextArguments(), s.failureClassifier(), s.lookup(), s.lookupTimeout()));
+                s.freeTextArguments(), s.failureClassifier(), s.lookup(), s.lookupTimeout(),
+                s.sideEffectMarker()));
     }
 
     /**
@@ -76,7 +78,8 @@ public abstract sealed class JournaledPolicy<P extends JournaledPolicy<P>> imple
         requirePositive(maxEffectDuration, "maxEffectDuration");
         Settings s = settings;
         return withSettings(new Settings(s.keyStrategy(), maxEffectDuration, s.deadline(), s.maxAttempts(),
-                s.freeTextArguments(), s.failureClassifier(), s.lookup(), s.lookupTimeout()));
+                s.freeTextArguments(), s.failureClassifier(), s.lookup(), s.lookupTimeout(),
+                s.sideEffectMarker()));
     }
 
     /**
@@ -89,7 +92,8 @@ public abstract sealed class JournaledPolicy<P extends JournaledPolicy<P>> imple
         requirePositive(deadline, "deadline");
         Settings s = settings;
         return withSettings(new Settings(s.keyStrategy(), s.maxEffectDuration(), deadline, s.maxAttempts(),
-                s.freeTextArguments(), s.failureClassifier(), s.lookup(), s.lookupTimeout()));
+                s.freeTextArguments(), s.failureClassifier(), s.lookup(), s.lookupTimeout(),
+                s.sideEffectMarker()));
     }
 
     /**
@@ -104,7 +108,8 @@ public abstract sealed class JournaledPolicy<P extends JournaledPolicy<P>> imple
         }
         Settings s = settings;
         return withSettings(new Settings(s.keyStrategy(), s.maxEffectDuration(), s.deadline(), maxAttempts,
-                s.freeTextArguments(), s.failureClassifier(), s.lookup(), s.lookupTimeout()));
+                s.freeTextArguments(), s.failureClassifier(), s.lookup(), s.lookupTimeout(),
+                s.sideEffectMarker()));
     }
 
     /**
@@ -118,7 +123,8 @@ public abstract sealed class JournaledPolicy<P extends JournaledPolicy<P>> imple
         Set<String> names = Set.copyOf(Arrays.asList(argumentNames)); // rejects null names
         Settings s = settings;
         return withSettings(new Settings(s.keyStrategy(), s.maxEffectDuration(), s.deadline(), s.maxAttempts(),
-                names, s.failureClassifier(), s.lookup(), s.lookupTimeout()));
+                names, s.failureClassifier(), s.lookup(), s.lookupTimeout(),
+                s.sideEffectMarker()));
     }
 
     /**
@@ -131,7 +137,8 @@ public abstract sealed class JournaledPolicy<P extends JournaledPolicy<P>> imple
         Objects.requireNonNull(failureClassifier, "failureClassifier");
         Settings s = settings;
         return withSettings(new Settings(s.keyStrategy(), s.maxEffectDuration(), s.deadline(), s.maxAttempts(),
-                s.freeTextArguments(), failureClassifier, s.lookup(), s.lookupTimeout()));
+                s.freeTextArguments(), failureClassifier, s.lookup(), s.lookupTimeout(),
+                s.sideEffectMarker()));
     }
 
     /**
@@ -144,7 +151,8 @@ public abstract sealed class JournaledPolicy<P extends JournaledPolicy<P>> imple
         Objects.requireNonNull(lookup, "lookup");
         Settings s = settings;
         return withSettings(new Settings(s.keyStrategy(), s.maxEffectDuration(), s.deadline(), s.maxAttempts(),
-                s.freeTextArguments(), s.failureClassifier(), lookup, s.lookupTimeout()));
+                s.freeTextArguments(), s.failureClassifier(), lookup, s.lookupTimeout(),
+                s.sideEffectMarker()));
     }
 
     /**
@@ -157,7 +165,24 @@ public abstract sealed class JournaledPolicy<P extends JournaledPolicy<P>> imple
         requirePositive(lookupTimeout, "lookupTimeout");
         Settings s = settings;
         return withSettings(new Settings(s.keyStrategy(), s.maxEffectDuration(), s.deadline(), s.maxAttempts(),
-                s.freeTextArguments(), s.failureClassifier(), s.lookup(), lookupTimeout));
+                s.freeTextArguments(), s.failureClassifier(), s.lookup(), lookupTimeout,
+                s.sideEffectMarker()));
+    }
+
+    /**
+     * Declares that the tool calls {@link ActionContext#beforeSideEffect()} before its first call that may change
+     * anything downstream, on the effect's own control path (before any hand-off to another thread).
+     * Then an exception thrown before that call is passed to the {@link FailureClassifier} as "effect not started"
+     * (the default classifier: definitely not applied, so a new attempt may start). Without this declaration every
+     * exception counts as thrown after the effect started, because the runner cannot tell a tool that threw before
+     * its marker from a tool that never calls it (docs/OPEN-QUESTIONS.md, OQ8).
+     *
+     * @return a new policy
+     */
+    public P usesSideEffectMarker() {
+        Settings s = settings;
+        return withSettings(new Settings(s.keyStrategy(), s.maxEffectDuration(), s.deadline(), s.maxAttempts(),
+                s.freeTextArguments(), s.failureClassifier(), s.lookup(), s.lookupTimeout(), true));
     }
 
     /**
@@ -249,6 +274,15 @@ public abstract sealed class JournaledPolicy<P extends JournaledPolicy<P>> imple
      */
     public Duration lookupTimeout() {
         return settings.lookupTimeout();
+    }
+
+    /**
+     * Returns whether the tool declared {@link #usesSideEffectMarker()}.
+     *
+     * @return {@code true} if exceptions before {@link ActionContext#beforeSideEffect()} count as "not started"
+     */
+    public boolean isSideEffectMarkerUsed() {
+        return settings.sideEffectMarker();
     }
 
     static void requirePositive(Duration duration, String name) {

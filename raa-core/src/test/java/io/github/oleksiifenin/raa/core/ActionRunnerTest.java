@@ -5,6 +5,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import io.github.oleksiifenin.raa.storage.ActionRecord;
 import io.github.oleksiifenin.raa.storage.ActionState;
 import io.github.oleksiifenin.raa.storage.FailureBasis;
+import io.github.oleksiifenin.raa.storage.FailureKind;
+import io.github.oleksiifenin.raa.storage.Resolution;
 import io.github.oleksiifenin.raa.testkit.InMemoryActionJournal;
 import java.io.IOException;
 import java.math.BigDecimal;
@@ -38,7 +40,8 @@ class ActionRunnerTest {
     private static final String SCOPE = "conversation-1";
     private static final Duration LEASE = Duration.ofSeconds(10);
     private static final Duration MAX_EFFECT = Duration.ofSeconds(60);
-    private static final KeyStrategy BY_ORDER = (call, args) -> ActionKey.of(SCOPE, call.toolName(),
+    private static final ActionKey ORDER_42 = ActionKey.of(SCOPE, "refund", "order-42");
+    private static final KeyStrategy BY_ORDER =(call, args) -> ActionKey.of(SCOPE, call.toolName(),
             args.string("orderId"));
 
     private final MutableClock clock = new MutableClock();
@@ -341,6 +344,98 @@ class ActionRunnerTest {
     }
 
     @Test
+    void callsDuringTheLookupBackoff_doNotLookUp_andAreToldWhenToCallAgain() {
+        AtomicInteger lookups = new AtomicInteger();
+        ActionRunner runner = runner(ActionPolicy.reconcilable((key, idempotencyKey) -> {
+            lookups.incrementAndGet();
+            return new LookupResult.Unreachable("503");
+        }).deadline(Duration.ofHours(4)));
+        runner.run(call("c1", "order-42", "10"), failing(new IOException("reset")));
+        clock.advance(MAX_EFFECT.plusMillis(1));
+        runner.run(call("c2", "order-42", "10"), succeeding("refunded"));
+        Instant backoffEnds = row("c1").resolveAfter();
+
+        List<ActionOutcome> duringBackoff = new ArrayList<>();
+        for (int i = 0; i < 10; i++) {
+            duringBackoff.add(runner.run(call("c" + (i + 3), "order-42", "10"), succeeding("refunded")));
+        }
+        int lookupsDuringBackoff = lookups.get();
+        clock.advance(Duration.ofSeconds(15));
+        runner.run(call("c13", "order-42", "10"), succeeding("refunded"));
+
+        assertThat(duringBackoff).allSatisfy(outcome -> assertThat(outcome).isInstanceOfSatisfying(
+                ActionOutcome.Unknown.class, unknown -> {
+                    assertThat(unknown.advice()).isEqualTo(RepeatAdvice.ASK_LATER);
+                    assertThat(unknown.reason()).contains(backoffEnds.toString());
+                }));
+        assertThat(lookupsDuringBackoff).isEqualTo(1);
+        assertThat(lookups).hasValue(2);
+        assertThat(row("c1").state()).isEqualTo(ActionState.UNKNOWN);
+        assertThat(row("c1").lookupFailures()).isEqualTo(2);
+        assertThat(effects).hasValue(1);
+    }
+
+    @Test
+    void callDuringTheLookupBackoff_idempotentDownstream_retriesWithTheSameKey_withoutALookup() {
+        AtomicInteger lookups = new AtomicInteger();
+        ActionRunner runner = runner(ActionPolicy.idempotentDownstream(Duration.ofHours(1))
+                .lookup((key, idempotencyKey) -> {
+                    lookups.incrementAndGet();
+                    return new LookupResult.Found("refunded earlier");
+                }));
+        runner.run(call("c1", "order-42", "10"), failing(new IOException("reset")));
+        clock.advance(MAX_EFFECT.plusMillis(1));
+        // A reconciler's lookup was unreachable: the row now backs off for 15 s.
+        journal.resolve(ORDER_42.hash(), 1, new Resolution.LookupUnreachable(Duration.ofSeconds(15)));
+
+        ActionOutcome outcome = runner.run(call("c2", "order-42", "10"), succeeding("refunded"));
+
+        assertThat(outcome).isEqualTo(new ActionOutcome.Succeeded("refunded", 2));
+        assertThat(lookups).hasValue(0);
+        assertThat(idempotencyKeys).hasSize(2).containsOnly(idempotencyKeys.get(0));
+    }
+
+    @Test
+    void callAtTheDeadlineInsideTheLookupBackoff_looksUpOnceMore_beforeEscalating() {
+        AtomicInteger lookups = new AtomicInteger();
+        ActionRunner runner = runner(ActionPolicy.reconcilable((key, idempotencyKey) -> {
+            lookups.incrementAndGet();
+            return new LookupResult.Unreachable("503");
+        }).deadline(Duration.ofMinutes(5)));
+        runner.run(call("c1", "order-42", "10"), failing(new IOException("reset")));
+        clock.advance(MAX_EFFECT.plusMillis(1));
+        journal.resolve(ORDER_42.hash(), 1, new Resolution.LookupUnreachable(Duration.ofMinutes(10)));
+
+        ActionOutcome beforeDeadline = runner.run(call("c2", "order-42", "10"), succeeding("refunded"));
+        clock.advance(Duration.ofMinutes(5));
+        ActionOutcome atDeadline = runner.run(call("c3", "order-42", "10"), succeeding("refunded"));
+
+        assertThat(beforeDeadline).isInstanceOfSatisfying(ActionOutcome.Unknown.class, unknown -> assertThat(
+                unknown.reason()).contains(row("c1").deadlineAt().toString())); // not the end of the 10 min backoff
+        assertThat(atDeadline).isInstanceOf(ActionOutcome.Escalated.class);
+        assertThat(lookups).hasValue(1);
+        assertThat(row("c1").state()).isEqualTo(ActionState.ESCALATED);
+        assertThat(effects).hasValue(1);
+    }
+
+    @Test
+    void callWhileAReconcilerHoldsTheRow_looksUpItself() {
+        ActionRunner runner = runner(ActionPolicy.reconcilable((key, idempotencyKey) ->
+                new LookupResult.Found("refunded by the first attempt")));
+        runner.run(call("c1", "order-42", "10"), failing(new IOException("reset")));
+        clock.advance(MAX_EFFECT.plusMillis(1));
+        assertThat(journal.takeReconcileBatch(Duration.ofMinutes(1), 10)).hasSize(1);
+
+        ActionOutcome outcome = runner.run(call("c2", "order-42", "10"), succeeding("refunded"));
+
+        assertThat(outcome).isInstanceOfSatisfying(ActionOutcome.Replayed.class, replayed -> {
+            assertThat(replayed.resultText()).isEqualTo("refunded by the first attempt");
+            assertThat(replayed.fromLookup()).isTrue();
+        });
+        assertThat(effects).hasValue(1);
+    }
+
+    @Test
     void lookupUnreachable_idempotentDownstream_doesNotBlockTheSafeRetry() {
         ActionRunner runner = runner(ActionPolicy.idempotentDownstream(Duration.ofHours(1))
                 .lookup((key, idempotencyKey) -> new LookupResult.Unreachable("503")));
@@ -612,6 +707,64 @@ class ActionRunnerTest {
                 .isInstanceOf(ActionOutcome.Unknown.class);
     }
 
+    // ---- side-effect marker (docs/OPEN-QUESTIONS.md, OQ8)
+
+    @Test
+    void errorBeforeTheMarker_withoutTheDeclaration_countsAsStarted_andIsUnknown() {
+        ActionRunner runner = runner(ActionPolicy.atLeastOnce());
+
+        ActionOutcome outcome = runner.run(call("c1", "order-42", "10"), failing(new IOException("refused")));
+
+        assertThat(outcome).isInstanceOfSatisfying(ActionOutcome.Unknown.class,
+                unknown -> assertThat(unknown.advice()).isEqualTo(RepeatAdvice.MAY_DUPLICATE));
+        assertThat(row("c1").state()).isEqualTo(ActionState.UNKNOWN);
+    }
+
+    @Test
+    void errorBeforeTheMarker_withTheDeclaration_isFailed_andAnAtMostOnceActionMayStartAgain() {
+        ActionRunner runner = runner(ActionPolicy.atMostOnce().usesSideEffectMarker());
+
+        ActionOutcome first = runner.run(call("c1", "order-42", "10"), failing(new IOException("refused")));
+        ActionRecord failed = row("c1");
+        ActionOutcome second = runner.run(call("c2", "order-42", "10"), succeedingAfterMarker("refunded"));
+
+        assertThat(first).isEqualTo(new ActionOutcome.Failed("refused", true));
+        assertThat(failed.state()).isEqualTo(ActionState.FAILED);
+        assertThat(failed.failureBasis()).isEqualTo(FailureBasis.DEFINITE);
+        assertThat(second).isEqualTo(new ActionOutcome.Succeeded("refunded", 2));
+        assertThat(effects).hasValue(2);
+    }
+
+    @Test
+    void errorAfterTheMarker_withTheDeclaration_isUnknown_soAnAtMostOnceActionIsEscalated() {
+        ActionRunner runner = runner(ActionPolicy.atMostOnce().usesSideEffectMarker());
+
+        ActionOutcome outcome = runner.run(call("c1", "order-42", "10"),
+                failingAfterMarker(new IOException("read timed out")));
+
+        assertThat(outcome).isInstanceOf(ActionOutcome.Escalated.class);
+        assertThat(row("c1").state()).isEqualTo(ActionState.ESCALATED);
+    }
+
+    @Test
+    void classifier_isToldWhetherTheMarkerWasPassed_onlyWhenTheToolDeclaresIt() {
+        List<Boolean> declared = Collections.synchronizedList(new ArrayList<>());
+        List<Boolean> undeclared = Collections.synchronizedList(new ArrayList<>());
+        ActionRunner withMarker = runner(ActionPolicy.atLeastOnce().usesSideEffectMarker()
+                .failureClassifier(recordingInto(declared)));
+        ActionRunner withoutMarker = actions(ActionPolicy.atLeastOnce().failureClassifier(recordingInto(undeclared))
+                .key((call, args) -> ActionKey.of(SCOPE, call.toolName(), "other")),
+                ReliableActions.DEFAULT_IN_PROGRESS_WAIT, ReliableActions.DEFAULT_RECORD_RETRY_BUDGET).runner();
+
+        withMarker.run(call("c1", "order-42", "10"), failing(new IOException("refused")));
+        withMarker.run(call("c2", "order-42", "10"), failingAfterMarker(new IOException("read timed out")));
+        withoutMarker.run(call("c3", "order-42", "10"), failing(new IOException("refused")));
+        withoutMarker.run(call("c4", "order-42", "10"), failingAfterMarker(new IOException("read timed out")));
+
+        assertThat(declared).containsExactly(false, true);
+        assertThat(undeclared).containsExactly(true, true);
+    }
+
     @Test
     void effectInterruptedWhileWaiting_keepsTheInterruptFlag() {
         ActionRunner runner = runner(ActionPolicy.atLeastOnce());
@@ -742,6 +895,29 @@ class ActionRunnerTest {
             effects.incrementAndGet();
             idempotencyKeys.add(context.idempotencyKey());
             throw error;
+        };
+    }
+
+    private Effect failingAfterMarker(Exception error) {
+        return context -> {
+            effects.incrementAndGet();
+            context.beforeSideEffect();
+            throw error;
+        };
+    }
+
+    private Effect succeedingAfterMarker(String resultText) {
+        return context -> {
+            effects.incrementAndGet();
+            context.beforeSideEffect();
+            return resultText;
+        };
+    }
+
+    private static FailureClassifier recordingInto(List<Boolean> effectStarted) {
+        return (error, started) -> {
+            effectStarted.add(started);
+            return FailureKind.INDETERMINATE;
         };
     }
 

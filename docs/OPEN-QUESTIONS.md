@@ -81,7 +81,7 @@ open memory-repair PR #4820 and quarkus-langchain4j #2744 ("tools are expected t
 as a community module. Earlier = talk without evidence; later = risk that someone else fills the gap. Every public post
 only after your "ок" on the exact text.
 
-## OQ8. How a tool opts into the side-effect marker — **open (found 2026-11-12 while implementing the runner)**
+## OQ8. How a tool opts into the side-effect marker — **DECIDED 2026-11-16: (a), opt-in on the policy (`usesSideEffectMarker()`)**
 
 §5 says exceptions before `ActionContext.beforeSideEffect()` are `DEFINITE` by default. A tool that never calls the
 marker would then have every exception, including a downstream timeout, classified as `DEFINITE` → `FAILED` → a new
@@ -93,10 +93,12 @@ marker" from "does not use the marker" without a declaration.
 * (b) Opt-in per call: the tool calls `ActionContext.current().declareSideEffectMarker()` first thing.
 * (c) Drop the marker; tools signal "not applied" only with `ActionRejectedException` or their own classifier.
 
-Current behavior (safe default): every effect counts as started; `beforeSideEffect()` has no effect yet. Blocks:
-nothing in week 3; must be decided before the README describes the marker.
+Implemented 2026-11-16: without `usesSideEffectMarker()` every effect counts as started (the safe default); with it,
+an exception before `beforeSideEffect()` is classified with `effectStarted = false`. Contract: mark before the first
+state-changing call and before any hand-off to another thread (the runner cannot see background work). Tests: `ActionRunnerTest`
+(side-effect marker section), `ActionPolicyTest`.
 
-## OQ9. Do callers honor the lookup backoff? — **open (found 2026-11-12 by the independent review)**
+## OQ9. Do callers honor the lookup backoff? — **DECIDED 2026-11-16: (a), row 8 honors `resolve_after`**
 
 Row 8 asks for a lookup whenever the lookup window is open; it does not look at `resolve_after`. The backoff written
 after an unreachable lookup (`min(2^n × 15 s, 10 min)`) therefore slows down only the reconciler. A model that calls a
@@ -108,4 +110,8 @@ after an unreachable lookup (`min(2^n × 15 s, 10 min)`) therefore slows down on
   `Unknown(ASK_LATER)` without a lookup. A change of the decision table: DESIGN §6 row 8 and its tests.
 * (b) Keep row 8; document that only the reconciler honors the backoff and that eight caller lookups escalate.
 
-Blocks: nothing on day 2; decide before the kill matrix covers `RECONCILABLE`.
+Implemented 2026-11-16 (DESIGN §6 row 8, revision 9). Two implementation choices within (a), found by the
+independent review: a reconciler's hold is not a backoff (only `lookup_failures > 0` with `resolve_after` ahead
+counts), and the backoff is ignored when the alternative is escalation, so the last lookup still runs. Tests: `DecisionTableTest`
+(`row8_duringTheLookupBackoff_*`, `row8_looksUpAgain_fromTheEndOfTheBackoff`, `row9_beforeTheLookupWindowOpens_*`),
+`ActionRunnerTest.callsDuringTheLookupBackoff_doNotLookUp_andAreToldWhenToCallAgain`.

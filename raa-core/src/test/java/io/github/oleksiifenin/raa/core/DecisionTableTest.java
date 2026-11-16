@@ -295,6 +295,85 @@ class DecisionTableTest {
 
     @ParameterizedTest
     @MethodSource("withLookup")
+    void row8_duringTheLookupBackoff_skipsTheLookup_retriesWhenSafe_elseAsksLater(Policy policy) {
+        ActionRecord backingOff = Row.of(ActionState.UNKNOWN).backingOff(1, NOW.plusMillis(1)).build();
+
+        Result result = decide(policy, backingOff, request(MATERIAL, ALL_ARGS));
+
+        if (policy.retriesUnknown()) {
+            result.is(List.of(8, 12), ClaimVerdict.START, new JournalWrite.StartAttempt(2));
+        } else {
+            result.is(List.of(8), ClaimVerdict.ASK_LATER, NONE);
+        }
+    }
+
+    @ParameterizedTest
+    @MethodSource("withLookup")
+    void row8_looksUpAgain_fromTheEndOfTheBackoff(Policy policy) {
+        ActionRecord backoffEndsNow = Row.of(ActionState.UNKNOWN).backingOff(1, NOW).build();
+        ActionRecord backoffEnded = Row.of(ActionState.UNKNOWN).backingOff(1, NOW.minusSeconds(1)).build();
+
+        decide(policy, backoffEndsNow, request(MATERIAL, ALL_ARGS)).is(List.of(8), ClaimVerdict.NEEDS_LOOKUP, NONE);
+        decide(policy, backoffEnded, request(MATERIAL, ALL_ARGS)).is(List.of(8), ClaimVerdict.NEEDS_LOOKUP, NONE);
+    }
+
+    @ParameterizedTest
+    @MethodSource("withLookup")
+    void row8_duringTheLookupBackoff_atTheDeadline_looksUpOnceMore(Policy policy) {
+        ActionRecord backingOffAtDeadline = Row.of(ActionState.UNKNOWN).backingOff(1, NOW.plusSeconds(30))
+                .deadlineAt(NOW).build();
+
+        Result result = decide(policy, backingOffAtDeadline, request(MATERIAL, ALL_ARGS));
+
+        result.is(List.of(8), ClaimVerdict.NEEDS_LOOKUP, NONE);
+    }
+
+    @ParameterizedTest
+    @MethodSource("withLookup")
+    void row8_duringTheLookupBackoff_withAttemptsExhausted_looksUpOnceMoreWhenTheRetryWouldEscalate(Policy policy) {
+        ActionRecord exhausted = Row.of(ActionState.UNKNOWN).attempt(3).backingOff(1, NOW.plusSeconds(30)).build();
+
+        Result result = decide(policy, exhausted, request(MATERIAL, ALL_ARGS));
+
+        if (policy.retriesUnknown()) {
+            result.is(List.of(8), ClaimVerdict.NEEDS_LOOKUP, NONE);
+        } else {
+            result.is(List.of(8), ClaimVerdict.ASK_LATER, NONE);
+        }
+    }
+
+    @ParameterizedTest
+    @MethodSource("withLookup")
+    void row8_aReconcilerHoldIsNoBackoff_soTheCallerLooksUp(Policy policy) {
+        ActionRecord held = Row.of(ActionState.UNKNOWN).resolveAfter(NOW.plusSeconds(30)).build();
+
+        decide(policy, held, request(MATERIAL, ALL_ARGS)).is(List.of(8), ClaimVerdict.NEEDS_LOOKUP, NONE);
+    }
+
+    @ParameterizedTest
+    @MethodSource("withLookup")
+    void row6_thenRow8_anExpiredLeaseHeldByAReconciler_isLookedUp(Policy policy) {
+        ActionRecord expiredAndHeld = Row.of(ActionState.EXECUTING).leaseUntil(NOW.minusMillis(1))
+                .resolveAfter(NOW.plusSeconds(30)).build();
+
+        Result result = decide(policy, expiredAndHeld, request(MATERIAL, ALL_ARGS));
+
+        result.is(List.of(6, 8), ClaimVerdict.NEEDS_LOOKUP, TO_UNKNOWN);
+    }
+
+    @ParameterizedTest
+    @MethodSource("withLookup")
+    void row9_beforeTheLookupWindowOpens_winsOverABackoff(Policy policy) {
+        ActionRecord windowClosed = Row.of(ActionState.UNKNOWN).startedAt(NOW.minusSeconds(1))
+                .backingOff(1, NOW.plusSeconds(30)).build();
+
+        Result result = decide(policy, windowClosed, request(MATERIAL, ALL_ARGS));
+
+        result.is(List.of(9), ClaimVerdict.ASK_LATER, NONE);
+    }
+
+    @ParameterizedTest
+    @MethodSource("withLookup")
     void row6_thenRow8_unreachableLookup_onAnExpiredLease(Policy policy) {
         Result result = decideAfterUnreachable(policy, executing(NOW.minusMillis(1)), request(MATERIAL, ALL_ARGS));
 
@@ -535,6 +614,8 @@ class DecisionTableTest {
         private Instant startedAt = NOW.minusSeconds(10);
         private Instant deadlineAt = NOW.plusSeconds(50);
         private FailureBasis failureBasis;
+        private Instant resolveAfter;
+        private int lookupFailures;
 
         private Row(ActionState state) {
             this.state = state;
@@ -564,6 +645,18 @@ class DecisionTableTest {
             return this;
         }
 
+        Row resolveAfter(Instant value) {
+            resolveAfter = value;
+            return this;
+        }
+
+        /** A backoff: the given number of unreachable lookups, the next one not before {@code until}. */
+        Row backingOff(int failures, Instant until) {
+            lookupFailures = failures;
+            resolveAfter = until;
+            return this;
+        }
+
         Row failureBasis(FailureBasis value) {
             failureBasis = value;
             return this;
@@ -572,7 +665,7 @@ class DecisionTableTest {
         ActionRecord build() {
             Instant createdAt = NOW.minusSeconds(10);
             return new ActionRecord(filled(9), null, "refund", "TEST", state, attempt, "owner-0", leaseUntil,
-                    MAX_EFFECT, createdAt, deadlineAt, startedAt, createdAt, null, 0, failureBasis, ALL_ARGS,
+                    MAX_EFFECT, createdAt, deadlineAt, startedAt, createdAt, resolveAfter, lookupFailures, failureBasis, ALL_ARGS,
                     filled(8), MATERIAL, null, null, null);
         }
     }

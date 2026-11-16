@@ -130,14 +130,20 @@ public final class DecisionTable implements ClaimDecider {
             return Evaluation.of(7, ClaimVerdict.CONFLICT, NO_WRITE);
         }
         if (policy.lookup().isPresent()) {
-            if (facts.row.attempt() != unreachableLookupAttempt) {
-                return facts.lookupWindowOpen()
-                        ? Evaluation.of(8, ClaimVerdict.NEEDS_LOOKUP, NO_WRITE)
-                        : Evaluation.of(9, ClaimVerdict.ASK_LATER, NO_WRITE);
-            }
-            // Row 8, lookup unreachable: a retry the policy already makes safe is not blocked (continue at row 10);
-            // otherwise ask later until the deadline, then continue at row 10.
             boolean retrySafe = idempotentDownstream || policy instanceof AtLeastOnce;
+            if (facts.row.attempt() != unreachableLookupAttempt) {
+                if (!facts.lookupWindowOpen()) {
+                    return Evaluation.of(9, ClaimVerdict.ASK_LATER, NO_WRITE);
+                }
+                // Row 8 honors the backoff of an earlier unreachable lookup (OQ9), except when the continuation
+                // would escalate: then one more lookup is the last chance to resolve the row without an operator.
+                boolean continuationEscalates = facts.deadlinePassed() || retrySafe && facts.attemptsExhausted();
+                if (!facts.inLookupBackoff() || continuationEscalates) {
+                    return Evaluation.of(8, ClaimVerdict.NEEDS_LOOKUP, NO_WRITE);
+                }
+            }
+            // Row 8, lookup unreachable or still backing off: a retry the policy already makes safe is not blocked
+            // (continue at row 10); otherwise ask later until the deadline, then continue at row 10.
             if (!retrySafe && !facts.deadlinePassed()) {
                 return Evaluation.of(8, ClaimVerdict.ASK_LATER, NO_WRITE);
             }
@@ -206,6 +212,15 @@ public final class DecisionTable implements ClaimDecider {
 
         boolean lookupWindowOpen() {
             return now.isAfter(row.startedAt().plus(row.maxEffectDuration()));
+        }
+
+        /**
+         * Whether the backoff after an unreachable lookup is still running. A future {@code resolve_after} without
+         * a lookup failure is a reconciler's hold on the row, not a backoff: callers may look up meanwhile (a
+         * lookup only reads; both resolutions are compare-and-set).
+         */
+        boolean inLookupBackoff() {
+            return row.lookupFailures() > 0 && row.resolveAfter() != null && row.resolveAfter().isAfter(now);
         }
     }
 

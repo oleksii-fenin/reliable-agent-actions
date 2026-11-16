@@ -1,6 +1,6 @@
 # Design — reliable-agent-actions (working name)
 
-Status: **DESIGN APPROVED** by the author (2026-11-09, revision 6; earlier: fourth independent review: approve with comments — see §14). Revision 7 (2026-11-11): storage-contract refinements found while implementing week 2, see §14. Revision 8 (2026-11-12): runtime of week 3, see §14.
+Status: **DESIGN APPROVED** by the author (2026-11-09, revision 6; earlier: fourth independent review: approve with comments — see §14). Revision 7 (2026-11-11): storage-contract refinements found while implementing week 2, see §14. Revision 8 (2026-11-12): runtime of week 3; revision 9 (2026-11-16): OQ8 and OQ9 decided, see §14.
 No implementation code until the author approves. Properties not yet covered by an executed test are **argued, not
 verified**. Numbers marked ASSUMPTION need the author's confirmation. Facts about other projects: `docs/research/*.md`
 (desk research of 2026-11-09, re-verify before publishing). Name `reliable-agent-actions`, module prefix `raa-`, Maven
@@ -154,11 +154,15 @@ public sealed interface ActionPolicy permits IdempotentDownstream, Reconcilable,
 //                                       Material arguments are canonicalized: JSON keys sorted, numbers as
 //                                       BigDecimal.stripTrailingZeros, values coerced to the tool schema's type
 //   failureClassifier(FailureClassifier)
+//   usesSideEffectMarker()              the tool calls ActionContext.beforeSideEffect() before its first state-changing
+//                                       call, on the effect's own control path (before any async hand-off); default
+//                                       off (OQ8): without it every exception counts as thrown after the effect started
 //   lookup(OutcomeLookup)               optional, except Reconcilable; lookupTimeout(Duration = 5 s)
 // wiring validation: maxEffectDuration < deadline; IdempotentDownstream: deadline <= downstreamDedupWindow
 
 @FunctionalInterface public interface FailureClassifier { FailureKind classify(Throwable error, boolean effectStarted); }
-// default: DEFINITE if !effectStarted (see ActionContext.beforeSideEffect) or ActionRejectedException; else INDETERMINATE
+// default: DEFINITE if !effectStarted or ActionRejectedException; else INDETERMINATE.
+// effectStarted = !policy.usesSideEffectMarker() || ActionContext.beforeSideEffect() was called
 
 @FunctionalInterface public interface OutcomeLookup { LookupResult lookup(ActionKey key, String idempotencyKey); }
 public sealed interface LookupResult {
@@ -198,7 +202,8 @@ public final class ActionContext {
     public static ActionContext current();     // ThreadLocal set around the effect; throws IllegalStateException
                                                // outside it (e.g. tool code hopped threads) — never returns null
     public String idempotencyKey(); public int attempt(); public ActionKey key();
-    public void beforeSideEffect();            // optional marker: exceptions before it are DEFINITE by default
+    public void beforeSideEffect();            // marker; counts only with usesSideEffectMarker(): exceptions before
+                                               // it are then DEFINITE by default
 }
 public final class ActionRejectedException extends RuntimeException {}   // tool says: definitely not applied
 
@@ -282,7 +287,7 @@ Rows are evaluated **top to bottom, first match wins**. "Args differ" = material
 | 5 | `EXECUTING` | lease live | poll up to `inProgressWait` (2 s) | its outcome if it completes, else `InProgressElsewhere` |
 | 6 | `EXECUTING` | lease expired | `markUnknownIfLeaseExpired`, re-evaluate as `UNKNOWN` | — |
 | 7 | `UNKNOWN` | args differ, or (`IDEMPOTENT_DOWNSTREAM` and all args differ) | none — a retry could duplicate, or reuse a downstream key with a different body | `Conflict(previousUnresolved)` |
-| 8 | `UNKNOWN` | a lookup is declared, `clock_timestamp() > started_at + maxEffectDuration` | `NEEDS_LOOKUP` (bounded by `lookupTimeout`, default 5 s; timeout = Unreachable) → Found: `SUCCEEDED`; NotFound: `AT_MOST_ONCE` → `ESCALATED`, others → `FAILED(LOOKUP)` and re-evaluate; Unreachable: `IDEMPOTENT_DOWNSTREAM`/`AT_LEAST_ONCE` continue at row 10 (rows 8–9 skipped), `RECONCILABLE`/`AT_MOST_ONCE` before the deadline return `Unknown(ASK_LATER)` with backoff, at/after the deadline continue at row 10 | `Replayed(fromLookup)` / … / `Unknown(ASK_LATER)` |
+| 8 | `UNKNOWN` | a lookup is declared, `clock_timestamp() > started_at + maxEffectDuration`, and no backoff of an earlier unreachable lookup is running (`lookup_failures > 0 and resolve_after > clock_timestamp()`; a reconciler's hold is not a backoff) unless the continuation would escalate (deadline passed, or attempts exhausted for `IDEMPOTENT_DOWNSTREAM`/`AT_LEAST_ONCE`). Inside the backoff: continue as for Unreachable, without a lookup (OQ9) | `NEEDS_LOOKUP` (bounded by `lookupTimeout`, default 5 s; timeout = Unreachable) → Found: `SUCCEEDED`; NotFound: `AT_MOST_ONCE` → `ESCALATED`, others → `FAILED(LOOKUP)` and re-evaluate; Unreachable: `IDEMPOTENT_DOWNSTREAM`/`AT_LEAST_ONCE` continue at row 10 (rows 8–9 skipped), `RECONCILABLE`/`AT_MOST_ONCE` before the deadline return `Unknown(ASK_LATER)` with backoff, at/after the deadline continue at row 10 | `Replayed(fromLookup)` / … / `Unknown(ASK_LATER)` |
 | 9 | `UNKNOWN` | a lookup is declared, before `started_at + maxEffectDuration` | none | `Unknown(ASK_LATER)` |
 | 10 | `UNKNOWN` | deadline passed or attempts exhausted (after the lookup of row 8, if any) | → `ESCALATED` | `Escalated` |
 | 11 | `UNKNOWN` | `AT_MOST_ONCE` | → `ESCALATED` | `Escalated` |
@@ -408,7 +413,7 @@ otherwise the guarantee is reduced to "per failover epoch".
 | Record write fails or is ambiguous | effect applied, row `EXECUTING` | retries within 3 s, read-back by `(key, attempt)`; then `UNKNOWN` after the lease → policy |
 | Thread interrupted after the effect returned | interrupt flag set | flag cleared for the record write, restored after |
 | Downstream timeout / 5xx / IO error | INDETERMINATE | `UNKNOWN`; model told per policy (safe to repeat / being verified) |
-| Exception before `beforeSideEffect()`, 4xx validation, `ActionRejectedException` | DEFINITE | `FAILED`; the model gets the error and may correct arguments |
+| Exception before `beforeSideEffect()` (tool declares `usesSideEffectMarker()`), 4xx validation, `ActionRejectedException` | DEFINITE | `FAILED`; the model gets the error and may correct arguments |
 | Model changes material arguments after success, same key | hash mismatch | `Conflict` with the recorded result; no effect |
 | Model changes free-text arguments only (e.g. e-mail body) | hash equal | `Replayed` — by design (`freeTextArguments`) |
 | Same key twice in one turn (concurrent tool execution) | live lease | second call polls ≤ 2 s; gets the outcome or `InProgressElsewhere`; the first call's result is in the same turn |
@@ -607,3 +612,17 @@ independent review of the same day: an interrupt during a lookup writes nothing 
 (it is not an unreachable downstream); NUL characters are replaced by U+FFFD in recorded text (PostgreSQL rejects
 them on every retry); numbers whose scale overflows are invalid arguments; the runner logs a warning when an attempt
 starts while the lease renewer was never started. Open: OQ9 (callers do not honor the lookup backoff).
+
+Revision 9 (2026-11-16, author's decisions OQ8 (a) and OQ9 (a), independent review: approve with comments, fixed the
+same day): a tool opts into the side-effect marker with `usesSideEffectMarker()` on its policy; only then an exception
+before `ActionContext.beforeSideEffect()` reaches the classifier as `effectStarted = false`. The marker must precede
+the first state-changing call on the effect's own control path; the runner reads it once, when the effect throws, so
+work handed to another thread before the marker is not seen (a documented limit). Row 8 skips the lookup while the
+backoff of an earlier unreachable lookup runs (`lookup_failures > 0` and `resolve_after` ahead) and continues as after
+an unreachable lookup: `IDEMPOTENT_DOWNSTREAM`/`AT_LEAST_ONCE` at row 10, the others `Unknown(ASK_LATER)` with the
+time the backoff ends, capped at the deadline. Refinements found by the review: a reconciler's hold (`resolve_after`
+ahead, no lookup failure) is not a backoff, so callers may look up meanwhile (otherwise a retry-safe caller would skip
+a lookup that could have found the effect); and the backoff is ignored when the continuation would escalate (deadline
+passed, or attempts exhausted for a retry-safe policy), so the last lookup before escalation still runs. The deadline
+and hold rules are implementation choices within decision (a), not part of its text. Row 9 still wins before the
+lookup window opens.

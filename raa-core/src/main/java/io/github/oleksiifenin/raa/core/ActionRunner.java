@@ -198,7 +198,8 @@ public final class ActionRunner {
                 try {
                     resultText = context.runOnCurrentThread(effect);
                 } catch (Exception e) {
-                    ActionOutcome outcome = recordFailure(attempt, e);
+                    boolean effectStarted = !policy.isSideEffectMarkerUsed() || context.sideEffectStarted();
+                    ActionOutcome outcome = recordFailure(attempt, e, effectStarted);
                     if (e instanceof InterruptedException) {
                         Thread.currentThread().interrupt();
                     }
@@ -230,8 +231,8 @@ public final class ActionRunner {
             return new ActionOutcome.Succeeded(resultText, attempt);
         }
 
-        private ActionOutcome recordFailure(int attempt, Exception error) {
-            FailureKind kind = classify(error);
+        private ActionOutcome recordFailure(int attempt, Exception error, boolean effectStarted) {
+            FailureKind kind = classify(error, effectStarted);
             String errorText = message(error);
             String recordedError = storable(errorText);
             RecordResult result = withRecordRetries(
@@ -246,11 +247,10 @@ public final class ActionRunner {
             return unknownOutcome(attempt, errorText, result);
         }
 
-        private FailureKind classify(Exception error) {
-            // Until the side-effect marker has an opt-in (ActionContext#beforeSideEffect), every effect counts as
-            // started. A classifier that fails or answers nothing leaves the outcome unknown, never "not applied".
+        private FailureKind classify(Exception error, boolean effectStarted) {
+            // A classifier that fails or answers nothing leaves the outcome unknown, never "not applied".
             try {
-                FailureKind kind = policy.failureClassifier().classify(error, true);
+                FailureKind kind = policy.failureClassifier().classify(error, effectStarted);
                 return kind == null ? FailureKind.INDETERMINATE : kind;
             } catch (RuntimeException e) {
                 LOG.log(System.Logger.Level.WARNING, "failure classifier of tool " + request.toolName() + " failed", e);
@@ -409,7 +409,8 @@ public final class ActionRunner {
             Instant after = row.resolveAfter() != null && row.resolveAfter().isAfter(windowOpens)
                     ? row.resolveAfter()
                     : windowOpens;
-            return after.toString();
+            // At the deadline row 8 looks up regardless of a backoff, so no caller needs to wait longer.
+            return (after.isAfter(row.deadlineAt()) ? row.deadlineAt() : after).toString();
         }
     }
 

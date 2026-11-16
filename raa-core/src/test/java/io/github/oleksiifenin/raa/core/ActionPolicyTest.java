@@ -39,7 +39,8 @@ class ActionPolicyTest {
     void setters_returnNewPolicies_andLeaveTheOriginalUnchanged() {
         IdempotentDownstream original = ActionPolicy.idempotentDownstream(Duration.ofHours(24));
 
-        IdempotentDownstream changed = original.key(KEY).maxEffectDuration(Duration.ofSeconds(10))
+        // The marker is declared first, so every later setter must carry it over.
+        IdempotentDownstream changed = original.usesSideEffectMarker().key(KEY).maxEffectDuration(Duration.ofSeconds(10))
                 .deadline(Duration.ofMinutes(5)).maxAttempts(5).freeTextArguments("body")
                 .lookup(LOOKUP).lookupTimeout(Duration.ofSeconds(2));
 
@@ -52,6 +53,8 @@ class ActionPolicyTest {
         assertThat(changed.freeTextArguments()).containsExactly("body");
         assertThat(changed.lookup()).containsSame(LOOKUP);
         assertThat(changed.lookupTimeout()).isEqualTo(Duration.ofSeconds(2));
+        assertThat(changed.isSideEffectMarkerUsed()).isTrue();
+        assertThat(original.isSideEffectMarkerUsed()).isFalse();
         assertThat(original.keyStrategy()).isEmpty();
         assertThat(original.deadline()).isEqualTo(Duration.ofMinutes(15));
     }

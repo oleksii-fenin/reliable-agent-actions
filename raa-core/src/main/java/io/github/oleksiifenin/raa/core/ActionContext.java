@@ -13,6 +13,7 @@ public final class ActionContext {
     private final ActionKey key;
     private final String idempotencyKey;
     private final int attempt;
+    private volatile boolean sideEffectStarted;
 
     ActionContext(ActionKey key, String idempotencyKey, int attempt) {
         this.key = Objects.requireNonNull(key, "key");
@@ -63,16 +64,24 @@ public final class ActionContext {
     }
 
     /**
-     * Marks the point after which the effect may have reached the downstream.
+     * Marks the point after which the effect may have reached the downstream. Call it on the effect's own control
+     * path, before the <em>first</em> call that may change anything downstream and before handing any work to
+     * another thread or an asynchronous client; later calls change nothing.
      *
-     * <p>Until the design fixes how a tool opts in (docs/OPEN-QUESTIONS.md), the runner treats every effect as
-     * started, so the default {@link FailureClassifier} classifies every exception except
-     * {@link ActionRejectedException} as "may have been applied". A tool that never calls this marker must not have
-     * its timeouts classified as "definitely not applied", and the runner cannot tell such a tool from one that threw
-     * before reaching the marker.
+     * <p>It counts only if the tool's policy declares {@link JournaledPolicy#usesSideEffectMarker()}. Then an
+     * exception thrown before the first call is classified with {@code effectStarted = false} (by default "definitely
+     * not applied"), and a new attempt may start, even for an at-most-once tool. The runner reads the marker once,
+     * when the effect throws: work that the tool started in the background and that marks or sends later is not seen,
+     * so such a tool must mark before the hand-off. Without the declaration every exception counts as thrown after
+     * the effect started: the runner cannot tell a tool that threw before this marker from one that never calls it.
      */
     public void beforeSideEffect() {
-        // Deliberately no effect yet: see the Javadoc.
+        sideEffectStarted = true;
+    }
+
+    /** Returns whether {@link #beforeSideEffect()} was called during this attempt. */
+    boolean sideEffectStarted() {
+        return sideEffectStarted;
     }
 
     /** Runs {@code effect} with this context installed on the current thread. */
