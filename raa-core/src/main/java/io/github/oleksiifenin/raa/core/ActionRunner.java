@@ -101,6 +101,12 @@ public final class ActionRunner {
         } catch (IllegalArgumentException e) {
             // Nothing was claimed or performed; the model may correct the arguments.
             return new ActionOutcome.Failed("invalid arguments: " + message(e), true);
+        } catch (NullPointerException e) {
+            // A null key component, typically a call without a scope. Not performed either; logged with its stack
+            // trace, because it can also be a bug in the key strategy.
+            LOG.log(System.Logger.Level.WARNING, "the key strategy of tool " + call.toolName() + " failed with a null"
+                    + " value; the call is not performed", e);
+            return new ActionOutcome.Failed("invalid arguments: " + message(e), true);
         }
         ClaimRequest request = new ClaimRequest(key.hash(), key.scopeHash(), keyText(key), call.toolName(),
                 journaled.journalName(), hashes.material(), hashes.all(), null, call.providerCallId(), owner, lease,

@@ -1,6 +1,6 @@
 # Design — reliable-agent-actions (working name)
 
-Status: **DESIGN APPROVED** by the author (2026-11-09, revision 6; earlier: fourth independent review: approve with comments — see §14). Revision 7 (2026-11-11): storage-contract refinements found while implementing week 2, see §14. Revision 8 (2026-11-12): runtime of week 3; revision 9 (2026-11-16): OQ8 and OQ9 decided; revision 10 (2026-11-16): reconciler, kill matrix, ADR-0004, see §14.
+Status: **DESIGN APPROVED** by the author (2026-11-09, revision 6; earlier: fourth independent review: approve with comments — see §14). Revision 7 (2026-11-11): storage-contract refinements found while implementing week 2, see §14. Revision 8 (2026-11-12): runtime of week 3; revision 9 (2026-11-16): OQ8 and OQ9 decided; revision 10 (2026-11-16): reconciler, kill matrix, ADR-0004; revision 11 (2026-11-16): LangChain4j adapter, ADR-0005, see §14.
 No implementation code until the author approves. Properties not yet covered by an executed test are **argued, not
 verified**. Numbers marked ASSUMPTION need the author's confirmation. Facts about other projects: `docs/research/*.md`
 (desk research of 2026-11-09, re-verify before publishing). Name `reliable-agent-actions`, module prefix `raa-`, Maven
@@ -234,14 +234,19 @@ public interface ActionJournal {
 
 // ---- raa-langchain4j
 public final class ReliableToolExecutor implements dev.langchain4j.service.tool.ToolExecutor {
-    // overrides execute(...) and executeWithContext(...); executeAsync(...) throws UnsupportedOperationException (v0.1)
+    // overrides execute(...) and executeWithContext(...); executeAsync(...) is NOT overridden (it does not exist in the
+    // 1.14.0 floor; where it exists, the inherited default completes exceptionally without running the tool)
+    // scope = chat memory id, but null for LangChain4j's "default" id (ADR-0005)
 }
 public final class ReliableTools {
     public static List<AiServiceTool> wrap(Object toolBean, ReliableActions actions);   // via ToolService.findTools;
-    // rejects tools with ReturnBehavior.IMMEDIATE unless allowImmediateReturn(toolName) is set (see §8)
+    public static Builder builder(ReliableActions actions);  // renderer(OutcomeRenderer), allowImmediateReturn(String...)
+    public List<AiServiceTool> wrap(Object toolBean); public List<AiServiceTool> wrap(List<AiServiceTool> tools);
+    // rejects tools without a policy and tools with ReturnBehavior.IMMEDIATE unless allowImmediateReturn(toolName) (§8);
+    // NONE tools are returned unchanged
 }
 public final class JournalChatMemoryRepair { public RepairReport repair(ChatMemory memory); }
-public interface OutcomeRenderer { String render(ActionOutcome outcome, ToolCall call); }   // text for the model
+public interface OutcomeRenderer { String render(ActionOutcome outcome, ToolCall call); static OutcomeRenderer standard(); }
 ```
 
 ## 6. Action lifecycle
@@ -560,8 +565,11 @@ server wrapper, strict mode, optional local-transaction mode (journal row and a 
   JVMs killed with SIGKILL, resumed by a new call — matches the table, and the negative controls see the duplicate
   (`KillMatrixTest`; a mutation of row 11 is caught by it); the runner per verdict and model-visible outcome; the
   reconciler per step, including on PostgreSQL with database time (`PostgresReconcilerTest`).
-* Not yet verified: mode (b) (memory repair, week 5), the two-JVM Q2 variant, Q1p (pause), Q3–Q7 beyond the reference
-  timing in the runner test. The final model text is checked as the `ActionOutcome` until `OutcomeRenderer` (week 4).
+* Verified since 2026-11-16 (week 4): the LangChain4j contract through a real `AiServices` and a scripted model on
+  1.14.0 and 1.23.0 (`LangChain4jContractTest`; a bypass of the decorator is caught by it); the shared
+  canonicalization vectors of ADR-0003 through the core's hashes; the default texts of §6 (`StandardOutcomeRenderer`).
+* Not yet verified: mode (b) (memory repair, week 5), the kill matrix through LangChain4j (week 5), the two-JVM Q2
+  variant, Q1p (pause), Q3–Q7 beyond the reference timing in the runner test.
 * Desk research (not re-verified by the author): framework signatures and memory ordering
   (`docs/research/framework-integration-surface.md`), competitor behavior (`docs/research/*.md`).
 * Argued: every guarantee in §1/§2 until the §9 tests exist and pass.
@@ -650,3 +658,25 @@ negative controls run in every `./gradlew build`, so on every CI job. The kill-m
 the row is checked in its crash state before the resume, so a child that finished on its own (for example an HTTP
 timeout while the response was held) fails the cell; external text in escalation reasons gets the U+0000 replacement;
 the PostgreSQL reconciler test no longer depends on scheduling (long lease, expired explicitly in database time).
+
+Revision 11 (2026-11-16, roadmap week 4; author's decision ADR-0005): `raa-langchain4j` compiles against LangChain4j
+1.14.0 (`compileOnly`, the floor) and is tested on 1.14.0 and 1.23.0 (`-Plangchain4jVersion`; the JDK 17 CI job runs
+the floors). Facts checked in the sources of both versions: `findTools` builds executors with
+`propagateToolExecutionExceptions(true)`, so a tool's exception arrives as `ToolExecutionException(cause)` and the
+classifier gets the cause; `ToolArgumentsException` is thrown before the method runs and becomes
+`ActionRejectedException` (definitely not applied); `executeAsync` exists only from some version after 1.14.0 and is
+not overridden; without `@MemoryId` the memory id is `"default"` (ADR-0005: no scope). Arguments are parsed by the
+adapter with Jackson (strict: object only, no duplicate keys; numbers exact; coerced to the schema type, ADR-0003).
+A freshly run tool's own `ToolExecutionResult` is passed on (contents included); every other outcome is rendered as
+text, with `isError` set only when the action was not performed (`Failed`, `Abandoned`, `JournalUnavailable`); a tool
+result marked as an error counts as an exception after the effect may have started. Core: `ReliableActions.policy`
+(wiring checks) and a null key component is "invalid arguments". Observed: LangChain4j 1.14.0 passes the JSON number
+`30` to a `BigDecimal` parameter as `30.0`, 1.23.0 as `30` (the tool's own text differs; the journal hashes the
+adapter's tree, so keys do not). Independent review (approve with comments, fixed the same day): a string coerced to an
+integer is bounded at 100 integer digits before any expansion (a model-sent `"1e10000000"` pinned a thread for
+minutes); scalar parameters are type-checked against the schema in the parser, so a mistyped value (`2.5` for an
+integer) is rejected before the claim instead of consuming an attempt inside LangChain4j; the `@MemoryId` hint is added
+only for the missing-scope error; a null from a key strategy is logged with its stack trace; the concurrency contract
+test proves the two calls overlap; a test asserts the LangChain4j jar on the class path is the requested version.
+Not coerced (documented, safe direction: a mismatch is a `Conflict`): values under `anyOf`, `$ref` and map-typed
+parameters.

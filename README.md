@@ -1,8 +1,8 @@
 # reliable-agent-actions
 
 > **Status: implementation in progress, not released** (design approved 2026-11-09). Core, PostgreSQL journal,
-> reconciler and the process-kill test exist; the LangChain4j adapter does not yet. This README describes intended
-> behavior; see the verification status below the guarantees.
+> reconciler, the process-kill test and the LangChain4j adapter (tested on 1.14.0 and 1.23.0) exist; chat-memory
+> repair does not yet. See the verification status below the guarantees.
 > Working name — see [`docs/OPEN-QUESTIONS.md`](docs/OPEN-QUESTIONS.md).
 
 A small Java library that makes **side-effecting tool calls of AI agents effectively-once**. Your agent's
@@ -59,10 +59,14 @@ tool call**, one that **pauses** it past its lease, and negative controls provin
 * **Verified — journal rules.** One live lease per key and fenced writes of stale attempts (journal TCK on PostgreSQL),
   the recorded result on repeat and the conflict on changed arguments, unknown outcomes never retried silently,
   deadlines and escalation, database time only (runner, reconciler and decision-table tests).
-* **Argued, not verified yet:** the pause past the lease (Q1p), chat-memory repair (mode (b)) and everything
-  LangChain4j-specific, failover behavior, overhead.
+* **Verified — LangChain4j adapter** through a real `AiServices` with a scripted model, on LangChain4j 1.14.0 and
+  1.23.0: a tool runs once, a regenerated call or a call after lost memory gets the recorded result, a crash during the
+  tool is retried with the same idempotency key, concurrent same-key calls run the tool once, invalid arguments and a
+  missing `@MemoryId` are "not performed"; specifications and `ReturnBehavior` are kept, `IMMEDIATE` is rejected.
+* **Argued, not verified yet:** the pause past the lease (Q1p), chat-memory repair (mode (b)), the kill matrix through
+  LangChain4j (week 5), failover behavior, overhead.
 
-## Quick start (intended API)
+## Quick start (API as implemented, not released)
 
 ```java
 // 1. Journal in your PostgreSQL (plain SQL migration shipped for Flyway/Liquibase)
@@ -79,9 +83,11 @@ ReliableActions actions = ReliableActions.builder(journal)
             .freeTextArguments("body")                                            // regenerated text is not a new action
             .maxEffectDuration(Duration.ofSeconds(20)))
     .tool("getOrder", ActionPolicy.none())                                          // read-only, not journaled
+    .storeKeyText(true)          // lets the reconciler look up sendEmail on its own; stores business ids (ADR-0004)
     .build();
 
-// 3. Wrap tools for LangChain4j — tool code stays as it is
+// 3. Wrap tools for LangChain4j — tool code stays as it is. The AI service method needs @MemoryId: the memory id is
+//    the scope of every action key, and without it the journaled tools are not performed (ADR-0005).
 Assistant assistant = AiServices.builder(Assistant.class)
     .chatModel(model)
     .chatMemoryProvider(memoryProvider)

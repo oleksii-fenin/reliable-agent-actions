@@ -19,6 +19,15 @@ class ReliableActionsTest {
     private static final KeyStrategy KEY = (call, args) -> ActionKey.of("s", call.toolName());
 
     @Test
+    void policy_returnsTheDeclaredPolicy_orNothing() {
+        ActionPolicy none = ActionPolicy.none();
+        ReliableActions actions = ReliableActions.builder(UNUSED_JOURNAL).tool("getOrder", none).build();
+
+        assertThat(actions.policy("getOrder")).containsSame(none);
+        assertThat(actions.policy("refund")).isEmpty();
+    }
+
+    @Test
     void build_rejectsAJournaledToolWithoutKeyStrategy() {
         ReliableActions.Builder builder = ReliableActions.builder(UNUSED_JOURNAL)
                 .tool("refund", ActionPolicy.atMostOnce().maxEffectDuration(Duration.ofSeconds(10)));

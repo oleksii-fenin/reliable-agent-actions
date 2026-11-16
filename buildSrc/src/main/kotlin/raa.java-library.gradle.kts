@@ -61,6 +61,7 @@ val allowedProjectDependencies = mapOf(
     ":raa-postgres" to setOf(":raa-storage-api"),
     ":raa-journal-tck" to setOf(":raa-storage-api", ":raa-core"),
     ":raa-testkit" to setOf(":raa-storage-api", ":raa-core"),
+    ":raa-langchain4j" to setOf(":raa-storage-api", ":raa-core"),
 )
 val modulesWithoutExternalDependencies = setOf(":raa-storage-api", ":raa-core")
 val productionConfigurations = listOf("api", "implementation", "compileOnly", "compileOnlyApi", "runtimeOnly")

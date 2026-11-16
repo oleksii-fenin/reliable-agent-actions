@@ -7,4 +7,5 @@ include(
     "raa-postgres",
     "raa-journal-tck",
     "raa-testkit",
+    "raa-langchain4j",
 )

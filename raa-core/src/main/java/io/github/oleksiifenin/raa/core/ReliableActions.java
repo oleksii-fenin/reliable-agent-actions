@@ -5,6 +5,7 @@ import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -18,12 +19,14 @@ public final class ReliableActions {
     static final Duration DEFAULT_IN_PROGRESS_WAIT = Duration.ofSeconds(2);
     static final Duration DEFAULT_RECORD_RETRY_BUDGET = Duration.ofSeconds(3);
 
+    private final Map<String, ActionPolicy> policies;
     private final LeaseRenewer leaseRenewer;
     private final ActionRunner runner;
     private final Reconciler reconciler;
 
     private ReliableActions(Builder builder) {
         String owner = UUID.randomUUID().toString(); // lease owner id of this wiring
+        this.policies = Map.copyOf(builder.policies);
         this.leaseRenewer = new LeaseRenewer(builder.journal, owner, builder.lease);
         this.runner = new ActionRunner(builder.journal, Map.copyOf(builder.policies), owner, builder.lease,
                 builder.inProgressWait, builder.recordRetryBudget, leaseRenewer, builder.storeKeyText);
@@ -57,6 +60,17 @@ public final class ReliableActions {
      */
     public LeaseRenewer leaseRenewer() {
         return leaseRenewer;
+    }
+
+    /**
+     * Returns the policy declared for a tool, so that framework adapters can reject tools without one when they are
+     * wired, not when the model first calls them.
+     *
+     * @param toolName the tool name
+     * @return the policy, empty if none is declared
+     */
+    public Optional<ActionPolicy> policy(String toolName) {
+        return Optional.ofNullable(policies.get(Objects.requireNonNull(toolName, "toolName")));
     }
 
     /**

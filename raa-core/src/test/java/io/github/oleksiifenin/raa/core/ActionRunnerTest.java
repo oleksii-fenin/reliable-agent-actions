@@ -596,6 +596,23 @@ class ActionRunnerTest {
     }
 
     @Test
+    void callWithoutAScope_whoseKeyNeedsOne_failsAsInvalidArguments_withoutClaiming() {
+        ActionRunner runner = runner(ActionPolicy.atMostOnce()
+                .key((call, args) -> ActionKey.of(call.scope(), call.toolName(), args.string("orderId"))));
+        Map<String, Object> arguments = Map.of("orderId", "order-42", "amount", new BigDecimal("10"));
+
+        ActionOutcome outcome = runner.run(new ToolCall("refund", arguments.toString(), arguments, "c1", null),
+                succeeding("refunded"));
+
+        assertThat(outcome).isInstanceOfSatisfying(ActionOutcome.Failed.class, failed -> {
+            assertThat(failed.error()).startsWith("invalid arguments").contains("scope");
+            assertThat(failed.retryable()).isTrue();
+        });
+        assertThat(journal.claims).hasValue(0);
+        assertThat(effects).hasValue(0);
+    }
+
+    @Test
     void nullResult_isRecordedAsEmptyText() {
         ActionRunner runner = runner(ActionPolicy.atMostOnce());
 
