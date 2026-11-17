@@ -1,6 +1,6 @@
 # Design — reliable-agent-actions (working name)
 
-Status: **DESIGN APPROVED** by the author (2026-11-09, revision 6; earlier: fourth independent review: approve with comments — see §14). Revision 7 (2026-11-11): storage-contract refinements found while implementing week 2, see §14. Revision 8 (2026-11-12): runtime of week 3; revision 9 (2026-11-16): OQ8 and OQ9 decided; revision 10 (2026-11-16): reconciler, kill matrix, ADR-0004; revision 11 (2026-11-16): LangChain4j adapter, ADR-0005, see §14.
+Status: **DESIGN APPROVED** by the author (2026-11-09, revision 6; earlier: fourth independent review: approve with comments — see §14). Revision 7 (2026-11-11): storage-contract refinements found while implementing week 2, see §14. Revision 8 (2026-11-12): runtime of week 3; revision 9 (2026-11-16): OQ8 and OQ9 decided; revision 10 (2026-11-16): reconciler, kill matrix, ADR-0004; revision 11 (2026-11-16): LangChain4j adapter, ADR-0005; revision 12 (2026-11-17): memory repair, example, Q1 through LangChain4j, see §14.
 No implementation code until the author approves. Properties not yet covered by an executed test are **argued, not
 verified**. Numbers marked ASSUMPTION need the author's confirmation. Facts about other projects: `docs/research/*.md`
 (desk research of 2026-11-09, re-verify before publishing). Name `reliable-agent-actions`, module prefix `raa-`, Maven
@@ -245,7 +245,10 @@ public final class ReliableTools {
     // rejects tools without a policy and tools with ReturnBehavior.IMMEDIATE unless allowImmediateReturn(toolName) (§8);
     // NONE tools are returned unchanged
 }
-public final class JournalChatMemoryRepair { public RepairReport repair(ChatMemory memory); }
+public final class JournalChatMemoryRepair { public RepairReport repair(ChatMemory memory); }   // from
+//   ReliableTools.memoryRepair(List<AiServiceTool>): same renderer and argument parsing as the wrapped tools
+public record RepairReport(List<Entry> entries) { boolean complete(); }  // Entry: id, tool, ANSWERED|PENDING|UNMAPPED, text
+// core: ActionRunner.inspect(ToolCall) — inspect mode; storage-api: ClaimVerdict.WOULD_START (inspect deciders only)
 public interface OutcomeRenderer { String render(ActionOutcome outcome, ToolCall call); static OutcomeRenderer standard(); }
 ```
 
@@ -568,8 +571,13 @@ server wrapper, strict mode, optional local-transaction mode (journal row and a 
 * Verified since 2026-11-16 (week 4): the LangChain4j contract through a real `AiServices` and a scripted model on
   1.14.0 and 1.23.0 (`LangChain4jContractTest`; a bypass of the decorator is caught by it); the shared
   canonicalization vectors of ADR-0003 through the core's hashes; the default texts of §6 (`StandardOutcomeRenderer`).
-* Not yet verified: mode (b) (memory repair, week 5), the kill matrix through LangChain4j (week 5), the two-JVM Q2
-  variant, Q1p (pause), Q3–Q7 beyond the reference timing in the runner test.
+* Verified since 2026-11-17 (week 5): Q1 end to end — the kill matrix of §9.1 through LangChain4j in modes (a) and (b),
+  32 cells plus 2 negative controls (`LangChain4jKillMatrixTest` in `examples/langchain4j-refund`); in mode (b) the
+  repaired text itself is asserted per cell (a repair that answers "not performed" everywhere is caught in 15 of 16
+  cells; the 16th is the cell where that answer is true); inspect mode per kind of answer — not every row
+  combination (`ActionRunnerTest`); memory repair
+  (`JournalChatMemoryRepairTest`), on LangChain4j 1.14.0 and 1.23.0.
+* Not yet verified: the two-JVM Q2 variant, Q1p (pause), Q3–Q7 beyond the reference timing in the runner test.
 * Desk research (not re-verified by the author): framework signatures and memory ordering
   (`docs/research/framework-integration-surface.md`), competitor behavior (`docs/research/*.md`).
 * Argued: every guarantee in §1/§2 until the §9 tests exist and pass.
@@ -680,3 +688,29 @@ only for the missing-scope error; a null from a key strategy is logged with its 
 test proves the two calls overlap; a test asserts the LangChain4j jar on the class path is the requested version.
 Not coerced (documented, safe direction: a mismatch is a `Conflict`): values under `anyOf`, `$ref` and map-typed
 parameters.
+
+Revision 12 (2026-11-17, roadmap week 5): inspect mode is `ActionRunner.inspect(ToolCall)`: the call is found through
+the call history by its provider id (not found → "not performed: you may call again with the same arguments", nothing
+claimed); otherwise the claim runs with an `InspectDecider` around the decision table, which turns a decision to start
+an attempt into `ClaimVerdict.WOULD_START` (a storage-api addition; storages only apply the write, which is at most the
+row-6 move to `UNKNOWN`) and the claim carries no provider id, so the call history is untouched. `WOULD_START` becomes
+`Unknown(SAFE)` (`IDEMPOTENT_DOWNSTREAM`), `Unknown(MAY_DUPLICATE)` (`AT_LEAST_ONCE`) or, for a `FAILED` row,
+"not performed: you may call again"; a live lease is `PENDING` at once (no in-progress wait); due lookups run as in a real
+call. `JournalChatMemoryRepair` inserts results right after the call's existing results, appending when the gap is at
+the end and rewriting the memory with `ChatMemory.set` otherwise; it uses the executor's scope and texts (ADR-0005
+hint included). Implementation choices: a lost result of a `NONE` (read-only) tool is answered "the result of this call
+was lost; the tool only reads, so you may call it again"; a call of a tool without a policy or unknown to the repair is
+`UNMAPPED`, like a call without an id. `examples/langchain4j-refund`: `RefundAgent` (journal and chat memory in
+PostgreSQL, `JdbcChatMemoryStore`), `ScriptedRefundModel` (the §9.1 scripted-model rules; like providers it rejects a
+history with a call without a result), `RefundDemo` (`./gradlew :examples:langchain4j-refund:run`). The LangChain4j kill
+matrix kills the agent itself; `AFTER_RECORD_BEFORE_MEMORY` is reached in a tool-executor decorator after the journal's
+executor returned and before LangChain4j adds the result to the memory; mode (a) retries the conversation with a fresh
+memory, mode (b) repairs and continues. It adds about 3.5 minutes to each CI job. Independent review (Codex, request changes,
+fixed the same day): a journal failure during repair is `PENDING` (nothing written), never "not performed"; repair takes
+the `@MemoryId` value explicitly when the memory's own id differs (`repair(memoryId, memory)`); inspect refuses a call
+that the call history maps to another action than its arguments now give (a changed key strategy) — repair reports it
+`UNMAPPED`; repaired memory is written in one `ChatMemory.set` (atomic in `MessageWindowChatMemory`, which evicts a
+call with its results together); answered calls without an id are matched by count; the example installs its schema
+under an advisory lock. Decided by the author the same day: a lookup whose resolution cannot be written returns
+`Unknown(ASK_LATER)` ("being verified; call again later"), no longer `JournalUnavailable` ("not performed"), because
+the lookup may have found the effect; `JournalUnavailable` now means only that nothing was started.

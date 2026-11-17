@@ -1,6 +1,7 @@
 package io.github.oleksiifenin.raa.langchain4j;
 
 import dev.langchain4j.agent.tool.ReturnBehavior;
+import dev.langchain4j.agent.tool.ToolSpecification;
 import dev.langchain4j.service.tool.AiServiceTool;
 import dev.langchain4j.service.tool.ToolService;
 import io.github.oleksiifenin.raa.core.ActionPolicy;
@@ -8,8 +9,10 @@ import io.github.oleksiifenin.raa.core.JournaledPolicy;
 import io.github.oleksiifenin.raa.core.ReliableActions;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 
@@ -85,6 +88,21 @@ public final class ReliableTools {
             wrapped.add(wrapOne(tool));
         }
         return List.copyOf(wrapped);
+    }
+
+    /**
+     * Returns the memory repair for these tools, with the same renderer and argument handling as the wrapped tools, so
+     * that a repaired answer and a real call never disagree.
+     *
+     * @param tools the tools of the AI service (wrapped or not; only their specifications are used)
+     * @return the repair
+     */
+    public JournalChatMemoryRepair memoryRepair(List<AiServiceTool> tools) {
+        Map<String, ToolSpecification> specifications = new HashMap<>();
+        for (AiServiceTool tool : tools) {
+            specifications.put(tool.name(), tool.toolSpecification());
+        }
+        return new JournalChatMemoryRepair(actions, renderer, parser, specifications);
     }
 
     private AiServiceTool wrapOne(AiServiceTool tool) {

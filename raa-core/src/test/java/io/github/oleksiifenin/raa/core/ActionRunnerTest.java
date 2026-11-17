@@ -1,6 +1,7 @@
 package io.github.oleksiifenin.raa.core;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.github.oleksiifenin.raa.storage.ActionRecord;
 import io.github.oleksiifenin.raa.storage.ActionState;
@@ -683,16 +684,28 @@ class ActionRunnerTest {
     }
 
     @Test
-    void journalFailingWhileResolvingALookup_isJournalUnavailable() {
-        ActionRunner runner = runner(ActionPolicy.reconcilable((key, idempotencyKey) -> new LookupResult.NotFound()));
-        runner.run(call("c1", "order-42", "10"), failing(new IOException("reset")));
+    void journalFailingWhileResolvingALookup_isBeingVerified_neverNotPerformed() {
+        // Changed 2026-11-17 with the author's approval: this was JournalUnavailable ("not performed"), which is false
+        // when the lookup found the effect.
+        ActionRunner notFound = runner(ActionPolicy.reconcilable((key, idempotencyKey) -> new LookupResult.NotFound()));
+        notFound.run(call("c1", "order-42", "10"), failing(new IOException("reset")));
+        ActionRunner found = runner(ActionPolicy.reconcilable((key, idempotencyKey) ->
+                new LookupResult.Found("refunded r-1")).key((call, args) -> ActionKey.of(SCOPE, call.toolName(), "other")));
+        found.run(call("c3", "order-42", "10"), failing(new IOException("reset")));
         clock.advance(MAX_EFFECT.plusMillis(1));
         journal.failResolves.set(true);
 
-        ActionOutcome outcome = runner.run(call("c2", "order-42", "10"), succeeding("refunded"));
+        List<ActionOutcome> outcomes = List.of(notFound.run(call("c2", "order-42", "10"), succeeding("refunded")),
+                found.run(call("c4", "order-42", "10"), succeeding("refunded")));
 
-        assertThat(outcome).isInstanceOf(ActionOutcome.JournalUnavailable.class);
-        assertThat(effects).hasValue(1);
+        assertThat(outcomes).allSatisfy(outcome -> assertThat(outcome).isInstanceOfSatisfying(
+                ActionOutcome.Unknown.class, unknown -> {
+                    assertThat(unknown.advice()).isEqualTo(RepeatAdvice.ASK_LATER);
+                    assertThat(unknown.reason()).contains("could not be recorded").endsWith("call again later");
+                }));
+        assertThat(row("c1").state()).isEqualTo(ActionState.UNKNOWN);
+        assertThat(row("c3").state()).isEqualTo(ActionState.UNKNOWN);
+        assertThat(effects).hasValue(2);
     }
 
     @Test
@@ -874,6 +887,138 @@ class ActionRunnerTest {
         assertThat(outcomes.stream().filter(f -> f.join() instanceof ActionOutcome.Succeeded)).hasSize(1);
     }
 
+    // ---- inspect mode (memory repair, docs/DESIGN.md §6)
+
+    @Test
+    void inspect_ofACallIdThatNeverClaimed_saysYouMayCallAgain_andClaimsNothing() {
+        ActionRunner runner = runner(ActionPolicy.atMostOnce());
+
+        ActionOutcome outcome = runner.inspect(call("c1", "order-42", "10"));
+
+        assertThat(outcome).isEqualTo(new ActionOutcome.Failed(ActionRunner.NOT_STARTED, true));
+        assertThat(journal.claims).hasValue(0);
+    }
+
+    @Test
+    void inspect_ofASucceededAction_isTheRecordedResult() {
+        ActionRunner runner = runner(ActionPolicy.atMostOnce());
+        runner.run(call("c1", "order-42", "10"), succeeding("refunded"));
+
+        assertThat(runner.inspect(call("c1", "order-42", "10")))
+                .isInstanceOfSatisfying(ActionOutcome.Replayed.class,
+                        replayed -> assertThat(replayed.resultText()).isEqualTo("refunded"));
+        assertThat(effects).hasValue(1);
+    }
+
+    @Test
+    void inspect_whereARealCallWouldRetry_saysWhetherRepeatingIsSafe_andStartsNothing() {
+        ActionRunner idempotent = runner(ActionPolicy.idempotentDownstream(Duration.ofHours(1)));
+        idempotent.run(call("c1", "order-42", "10"), failing(new IOException("reset")));
+        ActionRunner atLeastOnce = runner(ActionPolicy.atLeastOnce()
+                .key((call, args) -> ActionKey.of(SCOPE, call.toolName(), "other")));
+        atLeastOnce.run(call("c2", "order-42", "10"), failing(new IOException("reset")));
+
+        ActionOutcome safe = idempotent.inspect(call("c1", "order-42", "10"));
+        ActionOutcome mayDuplicate = atLeastOnce.inspect(call("c2", "order-42", "10"));
+
+        assertThat(safe).isInstanceOfSatisfying(ActionOutcome.Unknown.class,
+                unknown -> assertThat(unknown.advice()).isEqualTo(RepeatAdvice.SAFE));
+        assertThat(mayDuplicate).isInstanceOfSatisfying(ActionOutcome.Unknown.class,
+                unknown -> assertThat(unknown.advice()).isEqualTo(RepeatAdvice.MAY_DUPLICATE));
+        assertThat(row("c1").state()).isEqualTo(ActionState.UNKNOWN);
+        assertThat(row("c1").attempt()).isEqualTo(1);
+        assertThat(effects).hasValue(2);
+    }
+
+    @Test
+    void inspect_ofADeadAttempt_movesItToUnknown_andAtMostOnceIsEscalated() {
+        ActionRunner idempotent = runner(ActionPolicy.idempotentDownstream(Duration.ofHours(1)));
+        crash(idempotent, "c1", "order-42");
+        ActionRunner atMostOnce = runner(ActionPolicy.atMostOnce()
+                .key((call, args) -> ActionKey.of(SCOPE, call.toolName(), "other")));
+        crash(atMostOnce, "c2", "order-42");
+        clock.advance(LEASE.plusMillis(1));
+
+        ActionOutcome safe = idempotent.inspect(call("c1", "order-42", "10"));
+        ActionOutcome escalated = atMostOnce.inspect(call("c2", "order-42", "10"));
+
+        assertThat(safe).isInstanceOfSatisfying(ActionOutcome.Unknown.class,
+                unknown -> assertThat(unknown.advice()).isEqualTo(RepeatAdvice.SAFE));
+        assertThat(row("c1").state()).isEqualTo(ActionState.UNKNOWN);
+        assertThat(escalated).isInstanceOf(ActionOutcome.Escalated.class);
+        assertThat(row("c2").state()).isEqualTo(ActionState.ESCALATED);
+        assertThat(effects).hasValue(2);
+    }
+
+    @Test
+    void inspect_ofAnAttemptWithALiveLease_isPending_withoutWaiting() {
+        ActionRunner runner = runner(ActionPolicy.atLeastOnce(), Duration.ofSeconds(20));
+        crash(runner, "c1", "order-42");
+
+        long started = System.nanoTime();
+        ActionOutcome outcome = runner.inspect(call("c1", "order-42", "10"));
+
+        assertThat(outcome).isInstanceOf(ActionOutcome.InProgressElsewhere.class);
+        assertThat(System.nanoTime() - started).as("no in-progress wait").isLessThan(TimeUnit.SECONDS.toNanos(5));
+        assertThat(row("c1").state()).isEqualTo(ActionState.EXECUTING);
+    }
+
+    @Test
+    void inspect_ofADefinitelyFailedAttempt_saysYouMayCallAgain_andLeavesTheRow() {
+        ActionRunner runner = runner(ActionPolicy.atMostOnce());
+        runner.run(call("c1", "order-42", "10"), failing(new ActionRejectedException("declined")));
+
+        assertThat(runner.inspect(call("c1", "order-42", "10")))
+                .isEqualTo(new ActionOutcome.Failed(ActionRunner.NOT_STARTED, true));
+        assertThat(row("c1").state()).isEqualTo(ActionState.FAILED);
+        assertThat(row("c1").attempt()).isEqualTo(1);
+    }
+
+    @Test
+    void inspect_resolvesADueLookup_likeARealCall() {
+        ActionRunner runner = runner(ActionPolicy.reconcilable((key, idempotencyKey) ->
+                new LookupResult.Found("refunded r-1")));
+        runner.run(call("c1", "order-42", "10"), failing(new IOException("reset")));
+        clock.advance(MAX_EFFECT.plusMillis(1));
+
+        assertThat(runner.inspect(call("c1", "order-42", "10")))
+                .isInstanceOfSatisfying(ActionOutcome.Replayed.class, replayed -> {
+                    assertThat(replayed.resultText()).isEqualTo("refunded r-1");
+                    assertThat(replayed.fromLookup()).isTrue();
+                });
+        assertThat(row("c1").state()).isEqualTo(ActionState.SUCCEEDED);
+    }
+
+    @Test
+    void inspect_ofACallIdSupersededByARegeneratedCall_getsTheActionsAnswer() {
+        ActionRunner runner = runner(ActionPolicy.atLeastOnce());
+        runner.run(call("c1", "order-42", "10"), failing(new IOException("reset")));
+        runner.run(call("c2", "order-42", "10"), succeeding("refunded on retry"));
+
+        assertThat(runner.inspect(call("c1", "order-42", "10")))
+                .isInstanceOfSatisfying(ActionOutcome.Replayed.class,
+                        replayed -> assertThat(replayed.resultText()).isEqualTo("refunded on retry"));
+    }
+
+    @Test
+    void inspect_ofACallThatClaimedAnotherKeyThanItsArgumentsGiveNow_refusesToAnswer() {
+        runner(ActionPolicy.atMostOnce()).run(call("c1", "order-42", "10"), succeeding("refunded"));
+        ActionRunner changedKey = runner(ActionPolicy.atMostOnce()
+                .key((call, args) -> ActionKey.of(SCOPE, "refund-v2", args.string("orderId"))));
+
+        assertThatThrownBy(() -> changedKey.inspect(call("c1", "order-42", "10")))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("key strategy");
+    }
+
+    @Test
+    void inspect_needsTheProviderCallId() {
+        ActionRunner runner = runner(ActionPolicy.atLeastOnce());
+        Map<String, Object> arguments = Map.of("orderId", "order-42", "amount", new BigDecimal("10"));
+
+        assertThatThrownBy(() -> runner.inspect(new ToolCall("refund", "{}", arguments, null, SCOPE)))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
     // ---- helpers
 
     private ActionRunner runner(JournaledPolicy<?> policy) {
@@ -956,6 +1101,17 @@ class ActionRunnerTest {
             await(release);
             return resultText;
         };
+    }
+
+    private void crash(ActionRunner runner, String callId, String orderId) {
+        try {
+            runner.run(call(callId, orderId, "10"), context -> {
+                effects.incrementAndGet();
+                throw new SimulatedCrash();
+            });
+        } catch (SimulatedCrash expected) {
+            // an Error is not handled: the row stays EXECUTING, as after a crash
+        }
     }
 
     private ActionRecord row(String callId) {

@@ -62,6 +62,10 @@ val allowedProjectDependencies = mapOf(
     ":raa-journal-tck" to setOf(":raa-storage-api", ":raa-core"),
     ":raa-testkit" to setOf(":raa-storage-api", ":raa-core"),
     ":raa-langchain4j" to setOf(":raa-storage-api", ":raa-core"),
+    // The example is an application: it may wire every module (never published).
+    ":examples:langchain4j-refund" to setOf(
+        ":raa-storage-api", ":raa-core", ":raa-postgres", ":raa-langchain4j", ":raa-testkit",
+    ),
 )
 val modulesWithoutExternalDependencies = setOf(":raa-storage-api", ":raa-core")
 val productionConfigurations = listOf("api", "implementation", "compileOnly", "compileOnlyApi", "runtimeOnly")

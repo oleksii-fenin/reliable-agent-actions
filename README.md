@@ -1,8 +1,8 @@
 # reliable-agent-actions
 
 > **Status: implementation in progress, not released** (design approved 2026-11-09). Core, PostgreSQL journal,
-> reconciler, the process-kill test and the LangChain4j adapter (tested on 1.14.0 and 1.23.0) exist; chat-memory
-> repair does not yet. See the verification status below the guarantees.
+> reconciler, the LangChain4j adapter with chat-memory repair (tested on 1.14.0 and 1.23.0) and the process-kill test
+> through LangChain4j exist. See the verification status below the guarantees and `examples/langchain4j-refund`.
 > Working name — see [`docs/OPEN-QUESTIONS.md`](docs/OPEN-QUESTIONS.md).
 
 A small Java library that makes **side-effecting tool calls of AI agents effectively-once**. Your agent's
@@ -63,8 +63,11 @@ tool call**, one that **pauses** it past its lease, and negative controls provin
   1.23.0: a tool runs once, a regenerated call or a call after lost memory gets the recorded result, a crash during the
   tool is retried with the same idempotency key, concurrent same-key calls run the tool once, invalid arguments and a
   missing `@MemoryId` are "not performed"; specifications and `ReturnBehavior` are kept, `IMMEDIATE` is rejected.
-* **Argued, not verified yet:** the pause past the lease (Q1p), chat-memory repair (mode (b)), the kill matrix through
-  LangChain4j (week 5), failover behavior, overhead.
+* **Verified — end to end through LangChain4j** (`examples/langchain4j-refund`): the refund agent, with its chat memory
+  in PostgreSQL, is killed at the same four points and resumed either by retrying the conversation (mode (a)) or by
+  repairing the memory from the journal and continuing (mode (b)); all 32 cells match the table, and in mode (b) the
+  repaired answer itself is checked. Without the library the same agent refunds twice.
+* **Argued, not verified yet:** the pause past the lease (Q1p), failover behavior, overhead.
 
 ## Quick start (API as implemented, not released)
 
@@ -88,10 +91,12 @@ ReliableActions actions = ReliableActions.builder(journal)
 
 // 3. Wrap tools for LangChain4j — tool code stays as it is. The AI service method needs @MemoryId: the memory id is
 //    the scope of every action key, and without it the journaled tools are not performed (ADR-0005).
+ReliableTools reliableTools = ReliableTools.builder(actions).build();
+List<AiServiceTool> tools = reliableTools.wrap(new BillingTools());
 Assistant assistant = AiServices.builder(Assistant.class)
     .chatModel(model)
     .chatMemoryProvider(memoryProvider)
-    .tools(ReliableTools.wrap(new BillingTools(), actions))
+    .tools(tools)
     .build();
 
 // Inside a tool, pass the stable key downstream:
@@ -99,6 +104,10 @@ Assistant assistant = AiServices.builder(Assistant.class)
 String refundOrder(long orderId, BigDecimal amount) {
     return payments.refund(orderId, amount, ActionContext.current().idempotencyKey());
 }
+
+// After a restart, answer tool calls the crash left without a result, before the next message of a conversation:
+JournalChatMemoryRepair repair = reliableTools.memoryRepair(tools);
+RepairReport report = repair.repair(chatMemory);   // report.complete() == false: an attempt is still running
 
 // 4. Run the reconciler and the lease renewer (the Spring Boot starter will do this for you in v0.2)
 scheduler.scheduleWithFixedDelay(actions.reconciler()::runOnce, 15, 15, SECONDS);

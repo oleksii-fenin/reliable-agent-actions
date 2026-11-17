@@ -91,14 +91,8 @@ public final class ReliableToolExecutor implements ToolExecutor {
         if (outcome instanceof ActionOutcome.Succeeded && freshResult.get() != null) {
             return freshResult.get(); // this call ran the tool: the model gets its own result, contents included
         }
-        String text = Objects.requireNonNull(renderer.render(outcome, call), "the outcome renderer returned null");
-        if (scope == null && outcome instanceof ActionOutcome.Failed
-                && MISSING_SCOPE.equals(((ActionOutcome.Failed) outcome).error())) {
-            // ActionKey rejects a null scope with exactly this message; any other error keeps its own text.
-            text += "; this conversation has no scope: add @MemoryId to the AI service method or set the scope in the"
-                    + " tool's key strategy";
-        }
-        return ToolExecutionResult.builder().isError(isNotPerformed(outcome)).resultText(text).build();
+        return ToolExecutionResult.builder().isError(isNotPerformed(outcome))
+                .resultText(render(renderer, outcome, call)).build();
     }
 
     /** Runs the decorated tool, unwrapping LangChain4j's exception wrappers for the failure classifier. */
@@ -120,7 +114,19 @@ public final class ReliableToolExecutor implements ToolExecutor {
         }
     }
 
-    private static String scopeOf(Object memoryId) {
+    /** The model's text for an outcome; shared with memory repair so that both say the same. */
+    static String render(OutcomeRenderer renderer, ActionOutcome outcome, ToolCall call) {
+        String text = Objects.requireNonNull(renderer.render(outcome, call), "the outcome renderer returned null");
+        if (call.scope() == null && outcome instanceof ActionOutcome.Failed
+                && MISSING_SCOPE.equals(((ActionOutcome.Failed) outcome).error())) {
+            // ActionKey rejects a null scope with exactly this message; any other error keeps its own text.
+            text += "; this conversation has no scope: add @MemoryId to the AI service method or set the scope in the"
+                    + " tool's key strategy";
+        }
+        return text;
+    }
+
+    static String scopeOf(Object memoryId) {
         if (memoryId == null || ChatMemoryService.DEFAULT.equals(memoryId)) {
             return null;
         }

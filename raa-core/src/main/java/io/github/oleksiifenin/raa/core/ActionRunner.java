@@ -4,6 +4,7 @@ import io.github.oleksiifenin.raa.core.ArgumentsHasher.ArgumentHashes;
 import io.github.oleksiifenin.raa.storage.ActionJournal;
 import io.github.oleksiifenin.raa.storage.ActionRecord;
 import io.github.oleksiifenin.raa.storage.ActionState;
+import io.github.oleksiifenin.raa.storage.CallRecord;
 import io.github.oleksiifenin.raa.storage.ClaimRequest;
 import io.github.oleksiifenin.raa.storage.ClaimResult;
 import io.github.oleksiifenin.raa.storage.FailureKind;
@@ -14,9 +15,11 @@ import io.github.oleksiifenin.raa.storage.RecordResult;
 import io.github.oleksiifenin.raa.storage.Resolution;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
@@ -81,8 +84,59 @@ public final class ActionRunner {
      *                                  read-only tool is called directly, not through the runner)
      */
     public ActionOutcome run(ToolCall call, Effect effect) {
-        Objects.requireNonNull(call, "call");
         Objects.requireNonNull(effect, "effect");
+        Prepared prepared = prepare(call, call.providerCallId());
+        return prepared.failure != null ? prepared.failure : new Execution(prepared, effect).run();
+    }
+
+    /**
+     * Answers a tool call without performing anything (docs/DESIGN.md §6, "Inspect mode"), for memory repair: what a
+     * repeated call would be told, except that where it would start an attempt, it says whether repeating is safe. Only
+     * transitions that need no effect are applied: an expired attempt becomes {@code UNKNOWN}, a due outcome lookup
+     * resolves the row, an unresolvable outcome is escalated. The call is found through the call history by its
+     * provider tool-call id, so an id superseded by a regenerated call still gets the action's answer.
+     *
+     * @param call the call as the model emitted it; its provider tool-call id is required
+     * @return what happened, {@link ActionOutcome.InProgressElsewhere} for an attempt that still holds a live lease
+     *         (nothing can be said yet), {@link ActionOutcome.Failed} with {@link #NOT_STARTED} if this call id never
+     *         claimed the action, or {@link ActionOutcome.JournalUnavailable} if the journal could not be read — here it
+     *         means "cannot tell", not "not performed"
+     * @throws IllegalArgumentException if the tool has no journaled policy or the call has no provider tool-call id
+     * @throws IllegalStateException    if the call history maps the call to another action than its arguments give now
+     *                                  (the key strategy changed); answering it would describe the wrong action
+     */
+    public ActionOutcome inspect(ToolCall call) {
+        Objects.requireNonNull(call, "call");
+        if (call.providerCallId() == null) {
+            throw new IllegalArgumentException("inspect needs the provider tool-call id of the call");
+        }
+        Prepared prepared = prepare(call, null); // the claim must not touch the call history
+        if (prepared.failure != null) {
+            return prepared.failure;
+        }
+        try {
+            Optional<CallRecord> mapped = journal.findByProviderCallId(prepared.key.scopeHash(), call.providerCallId());
+            if (mapped.isEmpty()) {
+                return new ActionOutcome.Failed(NOT_STARTED, true);
+            }
+            if (!Arrays.equals(mapped.get().action().keyHash(), prepared.key.hash())) {
+                throw new IllegalStateException("call " + call.providerCallId() + " of tool " + call.toolName()
+                        + " claimed another action than its arguments give now (has the key strategy changed?)");
+            }
+            return new Execution(prepared, null).run();
+        } catch (JournalException e) {
+            return new ActionOutcome.JournalUnavailable(message(e));
+        } catch (InspectDecider.NoActionRowException e) {
+            return new ActionOutcome.Failed(NOT_STARTED, true);
+        }
+    }
+
+    /** The answer of inspect mode for a call that started nothing. */
+    public static final String NOT_STARTED = "you may call again with the same arguments";
+
+    /** Policy, key, hashes and claim request of one call, or why the call fails before anything is claimed. */
+    private Prepared prepare(ToolCall call, String providerCallId) {
+        Objects.requireNonNull(call, "call");
         ActionPolicy policy = policies.get(call.toolName());
         if (policy == null) {
             throw new IllegalArgumentException("no policy is declared for tool " + call.toolName());
@@ -100,18 +154,40 @@ public final class ActionRunner {
             hashes = hasher.hash(call.arguments(), journaled.freeTextArguments());
         } catch (IllegalArgumentException e) {
             // Nothing was claimed or performed; the model may correct the arguments.
-            return new ActionOutcome.Failed("invalid arguments: " + message(e), true);
+            return Prepared.failed(new ActionOutcome.Failed("invalid arguments: " + message(e), true));
         } catch (NullPointerException e) {
             // A null key component, typically a call without a scope. Not performed either; logged with its stack
             // trace, because it can also be a bug in the key strategy.
             LOG.log(System.Logger.Level.WARNING, "the key strategy of tool " + call.toolName() + " failed with a null"
                     + " value; the call is not performed", e);
-            return new ActionOutcome.Failed("invalid arguments: " + message(e), true);
+            return Prepared.failed(new ActionOutcome.Failed("invalid arguments: " + message(e), true));
         }
         ClaimRequest request = new ClaimRequest(key.hash(), key.scopeHash(), keyText(key), call.toolName(),
-                journaled.journalName(), hashes.material(), hashes.all(), null, call.providerCallId(), owner, lease,
+                journaled.journalName(), hashes.material(), hashes.all(), null, providerCallId, owner, lease,
                 journaled.maxEffectDuration().orElseThrow(), journaled.deadline());
-        return new Execution(journaled, tables.get(call.toolName()), key, request, effect).run();
+        return new Prepared(journaled, tables.get(call.toolName()), key, request, null);
+    }
+
+    /** The prepared parts of a call; {@code failure} set if it ends before the claim. */
+    private static final class Prepared {
+        final JournaledPolicy<?> policy;
+        final DecisionTable table;
+        final ActionKey key;
+        final ClaimRequest request;
+        final ActionOutcome failure;
+
+        Prepared(JournaledPolicy<?> policy, DecisionTable table, ActionKey key, ClaimRequest request,
+                ActionOutcome failure) {
+            this.policy = policy;
+            this.table = table;
+            this.key = key;
+            this.request = request;
+            this.failure = failure;
+        }
+
+        static Prepared failed(ActionOutcome failure) {
+            return new Prepared(null, null, null, null, failure);
+        }
     }
 
     /** The key text to store (ADR-0004), or {@code null} if disabled or not storable. */
@@ -136,18 +212,22 @@ public final class ActionRunner {
         private final ActionKey key;
         private final ClaimRequest request;
         private final Effect effect;
+        /** Inspect mode: no effect, no attempt started, no waiting for a live lease. */
+        private final boolean inspect;
         private DecisionTable table;
         private boolean resolvedByOwnLookup;
         private boolean waiting;
         private long waitEndNanos;
         private long pollPauseNanos;
 
-        Execution(JournaledPolicy<?> policy, DecisionTable table, ActionKey key, ClaimRequest request, Effect effect) {
-            this.policy = policy;
-            this.table = table;
-            this.key = key;
-            this.request = request;
+        /** {@code effect == null} means inspect mode. */
+        Execution(Prepared prepared, Effect effect) {
+            this.policy = prepared.policy;
+            this.table = prepared.table;
+            this.key = prepared.key;
+            this.request = prepared.request;
             this.effect = effect;
+            this.inspect = effect == null;
         }
 
         ActionOutcome run() {
@@ -155,7 +235,7 @@ public final class ActionRunner {
             while (true) {
                 ClaimResult claim;
                 try {
-                    claim = journal.claim(request, table);
+                    claim = journal.claim(request, inspect ? new InspectDecider(table) : table);
                 } catch (JournalException e) {
                     return new ActionOutcome.JournalUnavailable(message(e));
                 }
@@ -163,6 +243,8 @@ public final class ActionRunner {
                 switch (claim.decision().verdict()) {
                     case START:
                         return execute(row.attempt());
+                    case WOULD_START:
+                        return wouldStart(row);
                     case REPLAY:
                         return new ActionOutcome.Replayed(textOf(row), row.updatedAt(), resolvedByOwnLookup);
                     case CONFLICT:
@@ -170,7 +252,7 @@ public final class ActionRunner {
                                 ? new ActionOutcome.Conflict(textOf(row), false)
                                 : new ActionOutcome.Conflict(null, true);
                     case IN_PROGRESS:
-                        if (!pauseWhileInProgress()) {
+                        if (inspect || !pauseWhileInProgress()) {
                             return new ActionOutcome.InProgressElsewhere(row.leaseUntil());
                         }
                         continue;
@@ -198,6 +280,17 @@ public final class ActionRunner {
                             + " concurrent calls; call again later");
                 }
             }
+        }
+
+        /** Inspect mode, rows 1/12/15: what a repeated call would do, and whether repeating is safe. */
+        private ActionOutcome wouldStart(ActionRecord row) {
+            if (row.state() == ActionState.FAILED) {
+                return new ActionOutcome.Failed(NOT_STARTED, true); // row 15: the earlier attempt was not applied
+            }
+            String reason = withLastError("the outcome of the earlier attempt is unknown", row);
+            return policy instanceof IdempotentDownstream
+                    ? new ActionOutcome.Unknown(RepeatAdvice.SAFE, reason)
+                    : new ActionOutcome.Unknown(RepeatAdvice.MAY_DUPLICATE, reason);
         }
 
         /** Runs the effect of a started attempt and records its outcome. */
@@ -389,7 +482,10 @@ public final class ActionRunner {
                 // A lost compare-and-set means someone else resolved or restarted the row; the next claim sees it.
                 journal.resolve(row.keyHash(), row.attempt(), resolution);
             } catch (JournalException e) {
-                return new ActionOutcome.JournalUnavailable(message(e));
+                // Not "not performed": the lookup may have found the effect. The row stays as it was and is resolved by
+                // the next call or the reconciler.
+                return new ActionOutcome.Unknown(RepeatAdvice.ASK_LATER, "the outcome lookup could not be recorded ("
+                        + message(e) + "); call again later");
             }
             return null;
         }

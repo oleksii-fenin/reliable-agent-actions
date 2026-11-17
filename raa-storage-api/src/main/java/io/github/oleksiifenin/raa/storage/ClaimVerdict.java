@@ -17,5 +17,10 @@ public enum ClaimVerdict {
     /** The outcome is unknown and an operator is needed. */
     ESCALATED,
     /** The effect was not applied and no attempts are left. */
-    ABANDONED
+    ABANDONED,
+    /**
+     * Inspect mode only (docs/DESIGN.md §6, memory repair): the table would start an attempt, but nothing is started;
+     * the write is at most the move of an expired attempt to {@code UNKNOWN}.
+     */
+    WOULD_START
 }
