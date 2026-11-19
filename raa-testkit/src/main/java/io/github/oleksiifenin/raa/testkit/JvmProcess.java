@@ -3,6 +3,7 @@ package io.github.oleksiifenin.raa.testkit;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
@@ -15,11 +16,15 @@ import java.util.Optional;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.LockSupport;
 
 /**
- * A child JVM for kill tests: started as {@code java -cp <class path> <main class> <args>} directly, with no shell or
- * build tool in between, so {@link #kill()} delivers SIGKILL (on Linux and macOS) to the JVM itself. Its standard
- * output is read line by line; standard error is merged into it and kept for failure messages.
+ * A child JVM for kill and pause tests: started as {@code java -cp <class path> <main class> <args>} directly, with no
+ * shell or build tool in between, so {@link #kill()} delivers SIGKILL and {@link #pause()}/{@link #resume()} deliver
+ * SIGSTOP/SIGCONT (Linux and macOS; the latter two run the {@code kill} and {@code ps} commands; Windows is not
+ * supported) to the JVM itself. Its standard output
+ * is read line by line; standard error is merged into it and kept for failure messages. Lines can be written to its
+ * standard input with {@link #send(String)}.
  */
 public final class JvmProcess implements AutoCloseable {
 
@@ -78,7 +83,20 @@ public final class JvmProcess implements AutoCloseable {
     }
 
     /**
-     * Waits for the first line that starts with {@code prefix}, skipping others.
+     * Waits for the next line that starts with {@code prefix}, or for the timeout. Like {@link #awaitLine}, it consumes
+     * the lines it skips: a skipped line is not returned by a later call.
+     *
+     * @param prefix  the prefix
+     * @param timeout how long to wait
+     * @return the line, empty if none came in time
+     * @throws IllegalStateException if the process ends first; the message contains the output so far
+     */
+    public Optional<String> pollLine(String prefix, Duration timeout) {
+        return Optional.ofNullable(nextLine(prefix, timeout));
+    }
+
+    /**
+     * Waits for the first line that starts with {@code prefix}, consuming the lines it skips.
      *
      * @param prefix  the prefix
      * @param timeout how long to wait
@@ -87,14 +105,23 @@ public final class JvmProcess implements AutoCloseable {
      *                               the output so far
      */
     public String awaitLine(String prefix, Duration timeout) {
+        String line = nextLine(prefix, timeout);
+        if (line == null) {
+            throw new IllegalStateException("no line starting with '" + prefix + "' within " + timeout + "; output:\n"
+                    + output());
+        }
+        return line;
+    }
+
+    /** The next line with the prefix, {@code null} on timeout; throws if the output ends first. */
+    private String nextLine(String prefix, Duration timeout) {
         long end = System.nanoTime() + timeout.toNanos();
         try {
             while (true) {
                 long remaining = end - System.nanoTime();
                 String line = remaining <= 0 ? null : lines.poll(remaining, TimeUnit.NANOSECONDS);
                 if (line == null) {
-                    throw new IllegalStateException("no line starting with '" + prefix + "' within " + timeout
-                            + "; output:\n" + output());
+                    return null;
                 }
                 if (END_OF_OUTPUT.equals(line)) {
                     lines.add(line); // keep the end visible for later calls
@@ -108,6 +135,85 @@ public final class JvmProcess implements AutoCloseable {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException("interrupted while waiting for '" + prefix + "'", e);
+        }
+    }
+
+    /**
+     * Writes one line to the process's standard input and flushes it. A paused process reads it once it is resumed.
+     *
+     * @param line the line, without a line break
+     */
+    public void send(String line) {
+        try {
+            OutputStream in = process.getOutputStream();
+            in.write((line + "\n").getBytes(StandardCharsets.UTF_8));
+            in.flush();
+        } catch (IOException e) {
+            throw new UncheckedIOException("could not write to " + this, e);
+        }
+    }
+
+    /**
+     * Pauses the process with SIGSTOP (as a long GC pause or a frozen VM would): none of its threads runs until
+     * {@link #resume()}, its lease renewer included.
+     *
+     * @throws IllegalStateException if the signal cannot be sent or the process does not report itself stopped within
+     *                               10 seconds
+     */
+    public void pause() {
+        signal("-STOP");
+        long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (!isStopped()) {
+            if (System.nanoTime() > end) {
+                throw new IllegalStateException("the process did not stop: " + this);
+            }
+            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(10)); // polling the process state with a timeout
+        }
+    }
+
+    /**
+     * Resumes a paused process with SIGCONT.
+     *
+     * @throws IllegalStateException if the signal cannot be sent
+     */
+    public void resume() {
+        signal("-CONT");
+    }
+
+    /**
+     * Returns whether the operating system reports the process as stopped (state {@code T} of {@code ps}).
+     *
+     * @return {@code true} if stopped
+     */
+    public boolean isStopped() {
+        String state = run("ps", "-o", "stat=", "-p", Long.toString(pid())).trim();
+        return state.startsWith("T");
+    }
+
+    private void signal(String signal) {
+        run("kill", signal, Long.toString(pid()));
+    }
+
+    /** Runs a helper command; {@code ps} for a process that is gone (exit 1, no output) returns "". */
+    private static String run(String... command) {
+        String name = String.join(" ", command);
+        try {
+            Process helper = new ProcessBuilder(command).redirectErrorStream(true).start();
+            if (!helper.waitFor(10, TimeUnit.SECONDS)) { // its output is a few bytes and fits in the pipe meanwhile
+                helper.destroyForcibly();
+                throw new IllegalStateException(name + " did not finish within 10 seconds");
+            }
+            String output = new String(helper.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            boolean processGone = "ps".equals(command[0]) && helper.exitValue() == 1 && output.isBlank();
+            if (helper.exitValue() != 0 && !processGone) {
+                throw new IllegalStateException(name + " failed with exit code " + helper.exitValue() + ": " + output);
+            }
+            return output;
+        } catch (IOException e) {
+            throw new UncheckedIOException("could not run " + name, e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("interrupted while running " + name, e);
         }
     }
 

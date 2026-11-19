@@ -24,7 +24,7 @@ import org.junit.jupiter.api.RepeatedTest;
 /**
  * Quality scenario Q2 (docs/DESIGN.md §2) at the storage level: 32 threads in each of two "processes" (two journals
  * with their own data source and owner id) claim one key at the same moment; exactly one attempt starts.
- * The two-JVM variant runs with the process harness of roadmap week 3.
+ * The two-JVM variant through the runner is {@link TwoJvmConcurrencyTest}.
  */
 class ConcurrentClaimTest {
 

@@ -195,8 +195,8 @@ class KillMatrixTest {
                 KillMatrixChild.FIRST_CALL_ID).orElseThrow().action();
     }
 
-    /** The {@code RAA-FINAL} line of the resumed child. */
-    private static final class Final {
+    /** The {@code RAA-FINAL} line of a child (also used by {@link PauseTest}). */
+    static final class Final {
         final String outcome;
         final boolean fromLookup;
         final String text;

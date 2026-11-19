@@ -30,7 +30,8 @@ import java.util.concurrent.TimeUnit;
  *   <li>{@code GET /effects/<key>} is the outcome lookup: 200 with the stored response, 404 if nothing was applied,
  *       501 when lookups are off.</li>
  *   <li>With {@code holdsFirstResponse}, the first applied effect notifies {@link #awaitHeldResponse(Duration)} and its
- *       response is held until {@link #close()}: the {@link FaultPoint#EFFECT_APPLIED_RESPONSE_HELD} point.</li>
+ *       response is held until {@link #releaseHeldResponse()} or {@link #close()}: the
+ *       {@link FaultPoint#EFFECT_APPLIED_RESPONSE_HELD} point.</li>
  * </ul>
  */
 public final class FakeDownstream implements AutoCloseable {
@@ -75,7 +76,8 @@ public final class FakeDownstream implements AutoCloseable {
      *
      * @param deduplicates       whether a repeated idempotency key gets the stored response instead of a new effect
      * @param answersLookups     whether {@code GET /effects/<key>} answers
-     * @param holdsFirstResponse whether the first applied effect's response is held until {@link #close()}
+     * @param holdsFirstResponse whether the first applied effect's response is held until
+     *                           {@link #releaseHeldResponse()} or {@link #close()}
      * @return the running downstream
      */
     public static FakeDownstream start(boolean deduplicates, boolean answersLookups, boolean holdsFirstResponse) {
@@ -135,6 +137,11 @@ public final class FakeDownstream implements AutoCloseable {
      */
     public boolean awaitHeldResponse(Duration timeout) throws InterruptedException {
         return heldResponse.await(timeout.toNanos(), TimeUnit.NANOSECONDS);
+    }
+
+    /** Lets a held response (and every later one) go to its client; the server keeps running. */
+    public void releaseHeldResponse() {
+        release.countDown();
     }
 
     /** Releases a held response and stops the server. */

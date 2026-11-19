@@ -24,6 +24,46 @@ class JvmProcessTest {
         }
     }
 
+    /** A child that waits at its armed point for a line on standard input, then passes the remaining points. */
+    public static final class ResumableChild {
+        public static void main(String[] args) {
+            FaultInjector injector = FaultInjector.resumable(FaultPoint.valueOf(args[0]), System.out, System.in);
+            for (FaultPoint point : FaultPoint.values()) {
+                System.out.println("passing " + point);
+                injector.reach(point);
+            }
+            System.out.println("done");
+        }
+    }
+
+    @Test
+    void pausedChild_doesNotRun_untilResumed_andThenContinuesPastItsPoint() {
+        try (JvmProcess child = JvmProcess.start(ResumableChild.class, List.of("AFTER_CLAIM"))) {
+            child.awaitLine(FaultInjector.MARKER + "AFTER_CLAIM", Duration.ofSeconds(20));
+            child.pause();
+            assertThat(child.isStopped()).isTrue();
+
+            child.send("continue"); // buffered in the pipe; a stopped process cannot read it
+            assertThat(child.pollLine("done", Duration.ofMillis(500))).as("no progress while stopped").isEmpty();
+            assertThat(child.isStopped()).isTrue();
+
+            child.resume();
+            assertThat(child.awaitLine("done", Duration.ofSeconds(20))).isEqualTo("done");
+            assertThat(child.awaitExit(Duration.ofSeconds(20))).isZero();
+            assertThat(child.output()).contains("passing AFTER_RECORD_BEFORE_MEMORY");
+        }
+    }
+
+    @Test
+    void pausedChild_canStillBeKilled() {
+        try (JvmProcess child = JvmProcess.start(ResumableChild.class, List.of("AFTER_CLAIM"))) {
+            child.awaitLine(FaultInjector.MARKER, Duration.ofSeconds(20));
+            child.pause();
+
+            assertThat(child.kill()).isEqualTo(JvmProcess.KILLED_BY_SIGKILL);
+        }
+    }
+
     @Test
     void childStopsAtItsArmedPoint_andIsKilledThere_asAJvmWithoutWrapper() {
         try (JvmProcess child = JvmProcess.start(Child.class, List.of("AFTER_RESPONSE_BEFORE_RECORD"))) {

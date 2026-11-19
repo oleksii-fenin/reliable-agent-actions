@@ -3,6 +3,8 @@ junit = "6.1.3"
 assertj = "3.27.7"
 postgresql = "42.7.14"
 testcontainers = "2.0.5"
+# Test only: the pool of the database fault tests (Q6, ADR-0006). Latest release checked 2026-11-18 (Maven Central).
+hikaricp = "7.1.0"
 # Floor of the supported range (ADR-0002: findTools + tools(List<AiServiceTool>)); the adapter compiles against it.
 langchain4j-floor = "1.14.0"
 # Latest release checked 2026-11-16 (Maven Central); the default for the adapter tests.
@@ -15,5 +17,7 @@ junit-platform-launcher = { module = "org.junit.platform:junit-platform-launcher
 assertj-core = { module = "org.assertj:assertj-core", version.ref = "assertj" }
 postgresql = { module = "org.postgresql:postgresql", version.ref = "postgresql" }
 testcontainers-postgresql = { module = "org.testcontainers:testcontainers-postgresql", version.ref = "testcontainers" }
+testcontainers-toxiproxy = { module = "org.testcontainers:testcontainers-toxiproxy", version.ref = "testcontainers" }
+hikaricp = { module = "com.zaxxer:HikariCP", version.ref = "hikaricp" }
 junit-jupiter-api = { module = "org.junit.jupiter:junit-jupiter-api" }
 langchain4j-floor = { module = "dev.langchain4j:langchain4j", version.ref = "langchain4j-floor" }

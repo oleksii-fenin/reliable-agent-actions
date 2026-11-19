@@ -69,7 +69,10 @@ public final class KillMatrixChild {
 
     private KillMatrixChild(String[] args) {
         this.policyName = args[1];
-        this.injector = new FaultInjector("NONE".equals(args[2]) ? null : FaultPoint.valueOf(args[2]), System.out);
+        FaultPoint point = "NONE".equals(args[2]) ? null : FaultPoint.valueOf(args[2]);
+        this.injector = "pause-first".equals(args[0]) && point != null
+                ? FaultInjector.resumable(point, System.out, System.in)
+                : new FaultInjector(point, System.out);
         PGSimpleDataSource source = new PGSimpleDataSource();
         source.setUrl(args[3]);
         source.setUser(args[4]);
@@ -83,6 +86,7 @@ public final class KillMatrixChild {
         KillMatrixChild child = new KillMatrixChild(args);
         switch (args[0]) {
             case "first":
+            case "pause-first":
                 child.first();
                 break;
             case "resume":

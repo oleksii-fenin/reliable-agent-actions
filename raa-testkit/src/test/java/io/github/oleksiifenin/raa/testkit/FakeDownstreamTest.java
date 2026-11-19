@@ -74,6 +74,21 @@ class FakeDownstreamTest {
     }
 
     @Test
+    void releaseHeldResponse_letsTheHeldResponseGo_whileTheServerKeepsRunning() throws Exception {
+        try (FakeDownstream downstream = FakeDownstream.start(false, false, true)) {
+            CompletableFuture<HttpResponse<String>> held = client.sendAsync(postRequest(downstream, "k1"),
+                    HttpResponse.BodyHandlers.ofString());
+            assertThat(downstream.awaitHeldResponse(Duration.ofSeconds(10))).isTrue();
+            assertThat(held).isNotDone();
+
+            downstream.releaseHeldResponse();
+
+            assertThat(held.get(10, TimeUnit.SECONDS).body()).isEqualTo("effect 1 for k1");
+            assertThat(post(downstream, "k1").body()).isEqualTo("effect 2 for k1"); // still serving, not held
+        }
+    }
+
+    @Test
     void missingIdempotencyKey_isRejected_withoutAnEffect() throws Exception {
         try (FakeDownstream downstream = FakeDownstream.start(false, false, false)) {
             HttpResponse<String> response = client.send(HttpRequest.newBuilder(effects(downstream))

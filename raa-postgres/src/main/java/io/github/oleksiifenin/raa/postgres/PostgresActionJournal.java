@@ -21,6 +21,8 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.SQLTimeoutException;
+import java.sql.Statement;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
@@ -29,6 +31,10 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import javax.sql.DataSource;
 
 /**
@@ -36,27 +42,88 @@ import javax.sql.DataSource;
  * transaction on a connection from the given {@link DataSource}; every time is {@code clock_timestamp()} of the
  * database. The schema is {@code io/github/oleksiifenin/raa/postgres/schema/V1__raa_action.sql} on the class path; the
  * application applies it (Flyway, Liquibase or psql).
+ *
+ * <p>Every operation is bounded by the operation timeout (ADR-0006, default 2.5 s), counted from the moment it asks the
+ * data source for a connection. The transaction's {@code statement_timeout} and {@code lock_timeout} are set to 80 % of
+ * the remaining budget, so a slow statement or a row lock held by a frozen process is normally cancelled by the
+ * database while the connection stays usable; at the end of the budget the connection is aborted
+ * ({@link Connection#abort}), which ends any blocked read or write. A failure, a timeout included, is a
+ * {@link JournalException}; a {@code COMMIT} cut off this way may still have committed. Isolation level and timeouts
+ * are transaction-local, so connections go back to the pool with their session unchanged. Create one journal per
+ * database and reuse it: each has one daemon thread for the deadlines, which ends 30 s after the last operation.
+ *
+ * <p>The wait for a pooled connection and the set-up of a new physical connection cannot be bounded through
+ * {@link DataSource}; configure them below the operation timeout (for example HikariCP {@code connectionTimeout} and
+ * {@code validationTimeout}, pgjdbc {@code connectTimeout} and {@code loginTimeout}). A connection obtained after the
+ * budget is used up is given back unused and the operation fails. The data source must support
+ * {@link Connection#abort}.
  */
 public final class PostgresActionJournal implements ActionJournal {
+
+    /** The operation timeout of {@link #create(DataSource)}. */
+    public static final Duration DEFAULT_OPERATION_TIMEOUT = Duration.ofMillis(2500);
 
     private static final int CLAIM_ROUNDS = 3;
     private static final String MICROS = " * interval '1 microsecond'";
     private static final String NOW = "(select clock_timestamp() as now) t";
+    private static final System.Logger LOG = System.getLogger(PostgresActionJournal.class.getName());
+    /** Runs the abort on the watchdog thread; pgjdbc only closes the socket. */
+    private static final Executor DIRECT = Runnable::run;
 
     private final DataSource dataSource;
+    private final Duration operationTimeout;
+    private final long operationTimeoutNanos;
+    /** One daemon thread that aborts connections at their deadline; it ends when the journal is idle. */
+    private final ScheduledThreadPoolExecutor deadlines;
 
-    private PostgresActionJournal(DataSource dataSource) {
+    private PostgresActionJournal(DataSource dataSource, Duration operationTimeout) {
         this.dataSource = Objects.requireNonNull(dataSource, "dataSource");
+        this.operationTimeout = Objects.requireNonNull(operationTimeout, "operationTimeout");
+        if (operationTimeout.isNegative() || operationTimeout.isZero()) {
+            throw new IllegalArgumentException("operationTimeout must be positive: " + operationTimeout);
+        }
+        this.operationTimeoutNanos = operationTimeout.toNanos();
+        this.deadlines = new ScheduledThreadPoolExecutor(1, runnable -> {
+            Thread thread = new Thread(runnable, "raa-journal-deadline");
+            thread.setDaemon(true);
+            return thread;
+        });
+        this.deadlines.setRemoveOnCancelPolicy(true);
+        this.deadlines.setKeepAliveTime(30, TimeUnit.SECONDS);
+        this.deadlines.allowCoreThreadTimeOut(true);
     }
 
     /**
-     * Creates a journal on a data source whose database has the schema applied.
+     * Creates a journal with the default operation timeout (2.5 s) on a data source
+     * whose database has the schema applied.
      *
      * @param dataSource connections to the journal database; a small dedicated pool is recommended
      * @return the journal
      */
     public static PostgresActionJournal create(DataSource dataSource) {
-        return new PostgresActionJournal(dataSource);
+        return new PostgresActionJournal(dataSource, DEFAULT_OPERATION_TIMEOUT);
+    }
+
+    /**
+     * Creates a journal on a data source whose database has the schema applied.
+     *
+     * @param dataSource       connections to the journal database; a small dedicated pool is recommended
+     * @param operationTimeout the bound of every journal operation, connection wait included; positive
+     * @return the journal
+     * @throws IllegalArgumentException if the timeout is not positive
+     * @throws ArithmeticException      if the timeout does not fit in nanoseconds
+     */
+    public static PostgresActionJournal create(DataSource dataSource, Duration operationTimeout) {
+        return new PostgresActionJournal(dataSource, operationTimeout);
+    }
+
+    /**
+     * Returns the bound of every journal operation.
+     *
+     * @return the operation timeout
+     */
+    public Duration operationTimeout() {
+        return operationTimeout;
     }
 
     // ---- claim
@@ -65,16 +132,16 @@ public final class PostgresActionJournal implements ActionJournal {
     public ClaimResult claim(ClaimRequest request, ClaimDecider decider) {
         Objects.requireNonNull(request, "request");
         Objects.requireNonNull(decider, "decider");
-        return inTransaction("claim", connection -> {
+        return inTransaction("claim", tx -> {
             for (int round = 1; round <= CLAIM_ROUNDS; round++) {
-                Optional<ActionRecord> current = lockRow(connection, request.keyHash());
-                Instant now = databaseTime(connection);
+                Optional<ActionRecord> current = lockRow(tx, request.keyHash());
+                Instant now = databaseTime(tx);
                 ClaimDecision decision = decider.decide(request, current, now);
                 Optional<ActionRecord> written = current.isPresent()
-                        ? Optional.of(apply(connection, request, decision.write(), current.get()))
-                        : insertFirstAttempt(connection, request, decision);
+                        ? Optional.of(apply(tx, request, decision.write(), current.get()))
+                        : insertFirstAttempt(tx, request, decision);
                 if (written.isPresent()) {
-                    writeCallHistory(connection, request, decision, written.get());
+                    writeCallHistory(tx, request, decision, written.get());
                     return new ClaimResult(decision, written.get());
                 }
                 // A concurrent claim inserted the row first (or it was deleted in between): lock and decide again.
@@ -83,23 +150,23 @@ public final class PostgresActionJournal implements ActionJournal {
         });
     }
 
-    private Optional<ActionRecord> lockRow(Connection connection, byte[] keyHash) throws SQLException {
+    private Optional<ActionRecord> lockRow(Transaction tx, byte[] keyHash) throws SQLException {
         String sql = "select " + columns("") + " from raa_action where key_hash = ? for update";
-        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+        try (PreparedStatement statement = tx.prepare(sql)) {
             statement.setBytes(1, keyHash);
             return singleRow(statement);
         }
     }
 
-    private Instant databaseTime(Connection connection) throws SQLException {
-        try (PreparedStatement statement = connection.prepareStatement("select clock_timestamp()");
+    private Instant databaseTime(Transaction tx) throws SQLException {
+        try (PreparedStatement statement = tx.prepare("select clock_timestamp()");
              ResultSet resultSet = statement.executeQuery()) {
             resultSet.next();
             return instant(resultSet, 1);
         }
     }
 
-    private Optional<ActionRecord> insertFirstAttempt(Connection connection, ClaimRequest request,
+    private Optional<ActionRecord> insertFirstAttempt(Transaction tx, ClaimRequest request,
                                                       ClaimDecision decision) throws SQLException {
         if (!(decision.write() instanceof JournalWrite.StartAttempt)
                 || ((JournalWrite.StartAttempt) decision.write()).attempt() != 1) {
@@ -111,7 +178,7 @@ public final class PostgresActionJournal implements ActionJournal {
                 + " select ?, ?, ?, ?, 'EXECUTING', 1, ?, t.now + ?" + MICROS + ", ?" + MICROS + ", t.now,"
                 + " t.now + ?" + MICROS + ", t.now, t.now, ?, ?, ?, cast(? as jsonb) from " + NOW
                 + " on conflict (key_hash) do nothing returning " + columns("");
-        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+        try (PreparedStatement statement = tx.prepare(sql)) {
             int i = 0;
             statement.setBytes(++i, request.keyHash());
             statement.setString(++i, request.keyText());
@@ -129,18 +196,18 @@ public final class PostgresActionJournal implements ActionJournal {
         }
     }
 
-    private ActionRecord apply(Connection connection, ClaimRequest request, JournalWrite write, ActionRecord current)
+    private ActionRecord apply(Transaction tx, ClaimRequest request, JournalWrite write, ActionRecord current)
             throws SQLException {
         if (write instanceof JournalWrite.None) {
             return current;
         }
         if (write instanceof JournalWrite.StartAttempt) {
-            return startNextAttempt(connection, request, (JournalWrite.StartAttempt) write, current);
+            return startNextAttempt(tx, request, (JournalWrite.StartAttempt) write, current);
         }
-        return changeState(connection, ((JournalWrite.ChangeState) write).state(), current);
+        return changeState(tx, ((JournalWrite.ChangeState) write).state(), current);
     }
 
-    private ActionRecord startNextAttempt(Connection connection, ClaimRequest request, JournalWrite.StartAttempt write,
+    private ActionRecord startNextAttempt(Transaction tx, ClaimRequest request, JournalWrite.StartAttempt write,
                                           ActionRecord current) throws SQLException {
         if (write.attempt() != current.attempt() + 1) {
             throw new IllegalStateException("next attempt must be " + (current.attempt() + 1) + ", got " + write);
@@ -153,7 +220,7 @@ public final class PostgresActionJournal implements ActionJournal {
                 + " key_text = coalesce(?, key_text), result_text = null, last_error = null, failure_basis = null,"
                 + " lookup_failures = 0, resolve_after = null from " + NOW
                 + " where key_hash = ? and attempt = ? returning " + columns("raa_action.");
-        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+        try (PreparedStatement statement = tx.prepare(sql)) {
             int i = 0;
             statement.setInt(++i, write.attempt());
             statement.setString(++i, request.leaseOwner());
@@ -171,12 +238,12 @@ public final class PostgresActionJournal implements ActionJournal {
         }
     }
 
-    private ActionRecord changeState(Connection connection, ActionState state, ActionRecord current)
+    private ActionRecord changeState(Transaction tx, ActionState state, ActionRecord current)
             throws SQLException {
         String sql = "update raa_action set state = ?, lease_owner = null, lease_until = null, updated_at = t.now,"
                 + " resolve_after = case when ? then t.now else null end from " + NOW
                 + " where key_hash = ? and attempt = ? returning " + columns("raa_action.");
-        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+        try (PreparedStatement statement = tx.prepare(sql)) {
             statement.setString(1, state.name());
             statement.setBoolean(2, state == ActionState.UNKNOWN);
             statement.setBytes(3, current.keyHash());
@@ -185,7 +252,7 @@ public final class PostgresActionJournal implements ActionJournal {
         }
     }
 
-    private void writeCallHistory(Connection connection, ClaimRequest request, ClaimDecision decision,
+    private void writeCallHistory(Transaction tx, ClaimRequest request, ClaimDecision decision,
                                   ActionRecord row) throws SQLException {
         if (request.providerCallId() == null) {
             return;
@@ -197,7 +264,7 @@ public final class PostgresActionJournal implements ActionJournal {
                         ? "do update set attempt = excluded.attempt, seen_at = excluded.seen_at"
                         + " where raa_action_call.key_hash = excluded.key_hash"
                         : "do nothing");
-        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+        try (PreparedStatement statement = tx.prepare(sql)) {
             statement.setBytes(1, request.scopeHash());
             statement.setString(2, request.providerCallId());
             statement.setBytes(3, row.keyHash());
@@ -212,8 +279,8 @@ public final class PostgresActionJournal implements ActionJournal {
     public RecordResult recordSuccess(byte[] keyHash, int attempt, String resultText) {
         Objects.requireNonNull(keyHash, "keyHash");
         Objects.requireNonNull(resultText, "resultText");
-        return inTransaction("recordSuccess", connection -> {
-            Optional<ActionRecord> current = lockRow(connection, keyHash);
+        return inTransaction("recordSuccess", tx -> {
+            Optional<ActionRecord> current = lockRow(tx, keyHash);
             Optional<RecordResult> notApplicable = classifyRecordTarget(current, attempt);
             if (notApplicable.isPresent()) {
                 return notApplicable.get();
@@ -221,7 +288,7 @@ public final class PostgresActionJournal implements ActionJournal {
             String sql = "update raa_action set state = 'SUCCEEDED', result_text = ?, failure_basis = null,"
                     + " lease_owner = null, lease_until = null, resolve_after = null, updated_at = clock_timestamp()"
                     + " where key_hash = ? and attempt = ? and state <> 'SUCCEEDED' returning " + columns("");
-            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            try (PreparedStatement statement = tx.prepare(sql)) {
                 statement.setString(1, resultText);
                 statement.setBytes(2, keyHash);
                 statement.setInt(3, attempt);
@@ -234,8 +301,8 @@ public final class PostgresActionJournal implements ActionJournal {
     public RecordResult recordFailure(byte[] keyHash, int attempt, FailureKind kind, String error) {
         Objects.requireNonNull(keyHash, "keyHash");
         Objects.requireNonNull(kind, "kind");
-        return inTransaction("recordFailure", connection -> {
-            Optional<ActionRecord> current = lockRow(connection, keyHash);
+        return inTransaction("recordFailure", tx -> {
+            Optional<ActionRecord> current = lockRow(tx, keyHash);
             Optional<RecordResult> notApplicable = classifyRecordTarget(current, attempt);
             if (notApplicable.isPresent()) {
                 return notApplicable.get();
@@ -249,7 +316,7 @@ public final class PostgresActionJournal implements ActionJournal {
                     + " lease_until = null, resolve_after = t.now, updated_at = t.now from " + NOW
                     + " where key_hash = ? and attempt = ? and state in ('EXECUTING','UNKNOWN')"
                     + " returning " + columns("raa_action.");
-            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            try (PreparedStatement statement = tx.prepare(sql)) {
                 statement.setString(1, definite ? ActionState.FAILED.name() : ActionState.UNKNOWN.name());
                 statement.setString(2, definite ? FailureBasis.DEFINITE.name() : null);
                 statement.setString(3, error);
@@ -288,9 +355,9 @@ public final class PostgresActionJournal implements ActionJournal {
         String sql = "update raa_action set state = 'UNKNOWN', last_error = ?, lease_owner = null, lease_until = null,"
                 + " resolve_after = t.now, updated_at = t.now from " + NOW
                 + " where key_hash = ? and attempt = ? and state = 'EXECUTING' and lease_until < t.now";
-        return inTransaction("markUnknownIfLeaseExpired", connection -> {
-            lockRow(connection, keyHash);
-            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+        return inTransaction("markUnknownIfLeaseExpired", tx -> {
+            lockRow(tx, keyHash);
+            try (PreparedStatement statement = tx.prepare(sql)) {
                 statement.setString(1, reason);
                 statement.setBytes(2, keyHash);
                 statement.setInt(3, attempt);
@@ -324,15 +391,15 @@ public final class PostgresActionJournal implements ActionJournal {
             attempts[index] = keyAttempt.attempt();
             index++;
         }
-        return inTransaction("renewLeases", connection -> {
-            Array keyArray = connection.createArrayOf("bytea", keyHashes);
-            Array attemptArray = connection.createArrayOf("int4", attempts);
-            try (PreparedStatement statement = connection.prepareStatement(lock)) {
+        return inTransaction("renewLeases", tx -> {
+            Array keyArray = tx.connection().createArrayOf("bytea", keyHashes);
+            Array attemptArray = tx.connection().createArrayOf("int4", attempts);
+            try (PreparedStatement statement = tx.prepare(lock)) {
                 statement.setArray(1, keyArray);
                 statement.setArray(2, attemptArray);
                 statement.executeQuery().close();
             }
-            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            try (PreparedStatement statement = tx.prepare(sql)) {
                 statement.setLong(1, micros(lease));
                 statement.setArray(2, keyArray);
                 statement.setArray(3, attemptArray);
@@ -359,8 +426,8 @@ public final class PostgresActionJournal implements ActionJournal {
                 + " order by coalesce(resolve_after, '-infinity'), key_hash limit ? for update of raa_action skip locked)"
                 + " update raa_action a set resolve_after = t.now + ?" + MICROS + " from picked, t"
                 + " where a.key_hash = picked.key_hash returning " + columns("a.");
-        return inTransaction("takeReconcileBatch", connection -> {
-            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+        return inTransaction("takeReconcileBatch", tx -> {
+            try (PreparedStatement statement = tx.prepare(sql)) {
                 statement.setInt(1, limit);
                 statement.setLong(2, micros(hold));
                 List<ActionRecord> rows = new ArrayList<>();
@@ -403,8 +470,8 @@ public final class PostgresActionJournal implements ActionJournal {
         String textParameter = text;
         long backoffParameter = backoffMicros;
         String sourceParameter = sourceState;
-        return inTransaction("resolve", connection -> {
-            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+        return inTransaction("resolve", tx -> {
+            try (PreparedStatement statement = tx.prepare(sql)) {
                 int i = 0;
                 if (textParameter != null) {
                     statement.setString(++i, textParameter);
@@ -427,8 +494,8 @@ public final class PostgresActionJournal implements ActionJournal {
         String sql = "select c.provider_call_id, c.attempt as call_attempt, c.seen_at, " + columns("a.")
                 + " from raa_action_call c join raa_action a on a.key_hash = c.key_hash"
                 + " where c.scope_hash = ? and c.provider_call_id = ?";
-        return inTransaction("findByProviderCallId", connection -> {
-            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+        return inTransaction("findByProviderCallId", tx -> {
+            try (PreparedStatement statement = tx.prepare(sql)) {
                 statement.setBytes(1, scopeHash);
                 statement.setString(2, providerCallId);
                 try (ResultSet resultSet = statement.executeQuery()) {
@@ -448,31 +515,177 @@ public final class PostgresActionJournal implements ActionJournal {
     /** Work inside one transaction. */
     @FunctionalInterface
     private interface TransactionWork<T> {
-        T run(Connection connection) throws SQLException;
+        T run(Transaction tx) throws SQLException;
     }
 
-    private <T> T inTransaction(String operation, TransactionWork<T> work) {
-        try (Connection connection = dataSource.getConnection()) {
+    /** The connection of one operation and the end of its budget. */
+    private static final class Transaction {
+
+        private final Connection connection;
+        private final long deadlineNanos;
+
+        Transaction(Connection connection, long deadlineNanos) {
+            this.connection = connection;
+            this.deadlineNanos = deadlineNanos;
+        }
+
+        Connection connection() {
+            return connection;
+        }
+
+        PreparedStatement prepare(String sql) throws SQLException {
+            return connection.prepareStatement(sql);
+        }
+
+        /**
+         * Starts the transaction: READ COMMITTED and {@code statement_timeout}/{@code lock_timeout} at 80 % of the
+         * remaining budget, all transaction-local (one round trip), so the session goes back to the pool unchanged.
+         */
+        void begin() throws SQLException {
             connection.setAutoCommit(false);
-            connection.setTransactionIsolation(Connection.TRANSACTION_READ_COMMITTED);
-            try {
-                T result = work.run(connection);
-                connection.commit();
-                return result;
-            } catch (SQLException | RuntimeException e) {
-                rollbackAfterFailure(connection, e);
-                throw e;
+            long millis = Math.max(1, remainingMillis() * 4 / 5); // 0 would disable the timeouts
+            try (Statement statement = connection.createStatement()) {
+                statement.execute("set transaction isolation level read committed; set local statement_timeout = "
+                        + millis + "; set local lock_timeout = " + millis);
             }
-        } catch (SQLException e) {
-            throw new JournalException(operation + " failed: " + e.getMessage(), e);
+        }
+
+        /**
+         * Rolls back, keeping the failure as the primary exception.
+         *
+         * @return {@code true} if no transaction is left open
+         */
+        boolean rollbackAfter(Exception failure) {
+            try {
+                if (connection.getAutoCommit()) {
+                    return true; // no transaction began
+                }
+                connection.rollback();
+                return true;
+            } catch (SQLException rollbackFailure) {
+                failure.addSuppressed(rollbackFailure);
+                return false;
+            }
+        }
+
+        long remainingNanos() {
+            return deadlineNanos - System.nanoTime();
+        }
+
+        /** Whole milliseconds left, rounded up; zero when the budget is used up. */
+        private long remainingMillis() {
+            long remainingNanos = remainingNanos();
+            return remainingNanos <= 0 ? 0 : TimeUnit.NANOSECONDS.toMillis(remainingNanos + 999_999);
         }
     }
 
-    private static void rollbackAfterFailure(Connection connection, Exception failure) {
+    /**
+     * Runs one operation within the operation timeout. The watchdog is disarmed before the connection is closed, so it
+     * never touches a connection the pool may already have handed to another thread; the close does no round trip,
+     * because no transaction is left open (a failed rollback aborts the connection) and no session setting changed
+     * except auto-commit, which pools reset locally.
+     */
+    private <T> T inTransaction(String operation, TransactionWork<T> work) {
+        long deadlineNanos = System.nanoTime() + operationTimeoutNanos;
+        Connection connection;
         try {
-            connection.rollback();
-        } catch (SQLException rollbackFailure) {
-            failure.addSuppressed(rollbackFailure);
+            connection = dataSource.getConnection();
+        } catch (SQLException e) {
+            throw new JournalException(operation + " failed: " + e.getMessage(), e);
+        }
+        Transaction tx = new Transaction(connection, deadlineNanos);
+        Watchdog watchdog = null;
+        T result;
+        try {
+            if (tx.remainingNanos() <= 0) {
+                throw new SQLTimeoutException("the operation timeout of " + operationTimeout
+                        + " was used up before the transaction began");
+            }
+            watchdog = new Watchdog(connection, tx.remainingNanos());
+            tx.begin();
+            result = work.run(tx);
+            connection.commit();
+        } catch (SQLException | RuntimeException e) {
+            if (!tx.rollbackAfter(e)) {
+                abortQuietly(connection, e); // never hand a connection with an open transaction back to the pool
+            }
+            boolean aborted = watchdog != null && watchdog.disarm();
+            closeAfterFailure(connection, e);
+            if (e instanceof RuntimeException) {
+                throw (RuntimeException) e;
+            }
+            String budget = aborted ? " (operation timeout " + operationTimeout + ": connection aborted)" : "";
+            throw new JournalException(operation + " failed" + budget + ": " + e.getMessage(), e);
+        }
+        watchdog.disarm();
+        closeAfterCommit(connection, operation);
+        return result;
+    }
+
+    private static void abortQuietly(Connection connection, Exception failure) {
+        try {
+            connection.abort(DIRECT);
+        } catch (SQLException | RuntimeException abortFailure) {
+            failure.addSuppressed(abortFailure);
+        }
+    }
+
+    private static void closeAfterFailure(Connection connection, Exception failure) {
+        try {
+            connection.close();
+        } catch (SQLException closeFailure) {
+            failure.addSuppressed(closeFailure);
+        }
+    }
+
+    /** The operation committed: a failure to give the connection back does not change its result. */
+    private static void closeAfterCommit(Connection connection, String operation) {
+        try {
+            connection.close();
+        } catch (SQLException e) {
+            LOG.log(System.Logger.Level.WARNING, operation + " committed, but its connection could not be closed"
+                    + " cleanly", e);
+        }
+    }
+
+    /**
+     * Aborts the operation's connection when its budget ends ({@link Connection#abort}): pgjdbc closes the socket, which
+     * ends a blocked read or write. The abort runs on the deadline thread under the watchdog's lock, so once
+     * {@link #disarm} returns the watchdog has finished with the connection.
+     */
+    private final class Watchdog {
+
+        private final Connection connection;
+        private final ScheduledFuture<?> task;
+        private boolean disarmed;
+        private boolean fired;
+
+        Watchdog(Connection connection, long delayNanos) {
+            this.connection = connection;
+            this.task = deadlines.schedule(this::fire, delayNanos, TimeUnit.NANOSECONDS);
+        }
+
+        private synchronized void fire() {
+            if (disarmed) {
+                return;
+            }
+            fired = true;
+            try {
+                connection.abort(DIRECT);
+            } catch (SQLException | RuntimeException e) {
+                LOG.log(System.Logger.Level.WARNING, "could not abort a journal connection at its deadline", e);
+            }
+        }
+
+        /**
+         * Stops the watchdog; it does not touch the connection afterwards.
+         *
+         * @return whether it had aborted the connection
+         */
+        synchronized boolean disarm() {
+            disarmed = true;
+            task.cancel(false);
+            return fired;
         }
     }
 

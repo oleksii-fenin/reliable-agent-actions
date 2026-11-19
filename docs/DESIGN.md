@@ -50,7 +50,7 @@ All measures are ASSUMPTIONS proposed by the design; they drive tests, not marke
 | Q3 | Overhead | one journaled action, PostgreSQL on the same host | added latency | p99 **< 10 ms** (2 short transactions on the happy path) |
 | Q4 | Recovery | process dies during the effect | dead attempt detected; `RECONCILABLE` resolved | detected **≤ 45 s** (lease 30 s + sweep 15 s); resolved ≤ 45 s + `maxEffectDuration` + lookup |
 | Q5 | Throughput | one PostgreSQL | sustained journaled actions | **≥ 200/s** (4× the estimated peak, 40× the average; not optimized beyond) |
-| Q6 | Availability | journal DB down, unreachable (TCP blackhole), or pool exhausted | effect not started, result to the model within | **≤ 3 s** on the claim path (`claimTimeout` 2.5 s: pool wait, connect and network timeouts derived from the remaining budget); a live-lease poll (`inProgressWait` 2 s) or an inline lookup (`lookupTimeout` 5 s) adds its own bound |
+| Q6 | Availability | journal DB down, unreachable (TCP blackhole), or pool exhausted | effect not started, result to the model within | **≤ 3 s** on the claim path (journal operation timeout 2.5 s, ADR-0006: statement and lock timeouts from the remaining budget, the connection aborted at its end; pool wait and new connections bounded by the documented pool and driver settings); a live-lease poll (`inProgressWait` 2 s) or an inline lookup (`lookupTimeout` 5 s) adds its own bound |
 | Q7 | Upgradability | new LangChain4j minor release | adapter contract tests | pass on floor (1.14.0) and latest, weekly scheduled CI |
 
 Priority: Q1, Q1p, Q2 (the thesis) > Q6 > Q4 > Q3 > Q7 > Q5.
@@ -175,9 +175,11 @@ public sealed interface LookupResult {
 public final class ReliableActions {
     public static Builder builder(ActionJournal journal);
     // Builder: tool(String toolName, ActionPolicy), lease(Duration = 30 s), inProgressWait(Duration = 2 s),
-    //          claimTimeout(Duration = 2.5 s), recordRetryBudget(Duration = 3 s), telemetry(ActionTelemetry),
+    //          recordRetryBudget(Duration = 3 s), telemetry(ActionTelemetry),
     //          storeKeyText(boolean = false): key as reversible text in key_text, for reconciler lookups (ADR-0004).
     //          No clock setting: DB time only. Process owner id = random UUID per process start.
+    //          No claim timeout here: every journal operation is bounded by the storage's operation timeout
+    //          (PostgresActionJournal.create(dataSource, operationTimeout = 2.5 s), ADR-0006).
     public ActionRunner runner();
     public Reconciler reconciler();               // runOnce(); scheduled by the app (or the v0.2 starter)
     public LeaseRenewer leaseRenewer();           // start()/close(); one per process
@@ -401,8 +403,8 @@ create index raa_action_resolve       on raa_action (resolve_after nulls first) 
 create index raa_action_terminal      on raa_action (updated_at)    where state in ('SUCCEEDED','ABANDONED');
 ```
 
-Claim transaction (READ COMMITTED; `Connection.setNetworkTimeout` and statement timeout from the remaining
-`claimTimeout`): `SELECT … FOR UPDATE`, then `clock_timestamp()`, then the decision table; with no row the decider
+Claim transaction (READ COMMITTED; like every journal operation bounded by the operation timeout of ADR-0006:
+`statement_timeout`/`lock_timeout` at 80 % of the remaining budget, the connection aborted at its end): `SELECT … FOR UPDATE`, then `clock_timestamp()`, then the decision table; with no row the decider
 must start attempt 1, inserted with `INSERT … ON CONFLICT (key_hash) DO NOTHING RETURNING …`; if a concurrent claim
 inserted first (nothing returned) or the row was deleted in between, lock and decide again, at most 3 rounds. The
 call-id row is written in the same transaction: inserted if new (`ON CONFLICT DO NOTHING`), its attempt updated only
@@ -439,7 +441,7 @@ otherwise the guarantee is reduced to "per failover epoch".
 | Process paused > lease (GC, VM freeze, SIGSTOP), then resumes | row `UNKNOWN`, maybe attempt n+1 | stale journal writes fenced (0 rows); `IDEMPOTENT_DOWNSTREAM`: downstream dedups; `AT_LEAST_ONCE`: duplicate allowed; `RECONCILABLE`: duplicate possible if the paused request lands after a `NotFound` — non-guarantee, demonstrated by Q1p |
 | Renewer starved (pool exhausted, DB slow) | leases expire while effects run | same as pause; dedicated small journal pool, renewer uses its own connection budget |
 | Effect hangs beyond `maxEffectDuration` | renewal stops | lease expires → `UNKNOWN`; a late result of the same attempt still lands via CAS |
-| Pool exhausted at claim | no connection within `claimTimeout` (2.5 s) | `JournalUnavailable`, effect not started (Q6) |
+| Pool exhausted at claim | no connection within the pool's wait (documented ≤ the operation timeout, ADR-0006) | `JournalUnavailable`, effect not started (Q6) |
 | Journal DB down | claim fails | fail closed: `JournalUnavailable` |
 | Async replica failover lost committed rows | row missing | **not handled** — see §7 durability requirement |
 | Tool code hops threads | `ActionContext.current()` called outside the context | `IllegalStateException` (loud), never a null key |
@@ -465,7 +467,7 @@ otherwise the guarantee is reduced to "per failover epoch".
 | Negative controls | same matrix with the library bypassed and with `FakeDownstream` dedup off: the test **must fail** (expects ≥ 2 effects or a false "not executed") — proves the harness can see duplicates | test validity |
 | Pause test (Q1p) | `kill -STOP` the child during the held effect past the lease; second child retries; `kill -CONT`; assert stale writes fenced and effect counts per policy; `RECONCILABLE` duplicate asserted as the documented non-guarantee | R1 limits |
 | Randomized (nightly) | kill at a random delay inside the effect window; 500 runs per policy | windows the fixed points miss |
-| Ambiguous commit / DB faults | Toxiproxy between client and PostgreSQL: cut after COMMIT for claim and record; pause container (fail closed, Q6); pool exhaustion | R10, §8 rows |
+| Ambiguous commit / DB faults | Toxiproxy between client and PostgreSQL: response or request lost at COMMIT for claim and record; blackhole, database down, paused container (fail closed, Q6); pool exhaustion; every journal operation bounded while blackholed; a row lock held by a frozen process | R10, §8 rows, ADR-0006 |
 | LangChain4j contract | scripted fake `ChatModel`; specs and `ReturnBehavior` preserved; `IMMEDIATE` rejected; concurrent tool execution with same-key calls; replay text; memory repair yields a history where every tool call has a result, including the superseded-call-id case | R6, R7 |
 | OTel | `InMemorySpanExporter` / `InMemoryMetricReader`: one span per action with key hash, policy, attempt, outcome | R8 |
 | Clock | child JVM under libfaketime shifted ±1 h; decisions unchanged | DB-time rule |
@@ -557,7 +559,7 @@ server wrapper, strict mode, optional local-transaction mode (journal row and a 
 | Framework API churn | adapter breaks | public APIs only, floor+latest CI matrix, weekly scheduled build |
 | Schedule (8–12 h/week) | v0.1 slips | stage gates; week 3 alone is a demonstrable result |
 
-## 13. Verified vs argued (as of 2026-11-16)
+## 13. Verified vs argued (as of 2026-11-18)
 
 * Verified by executed tests (`./gradlew build`, PostgreSQL 14 and 18): the §6 decision table per row and policy;
   key canonicalization; policy validation; `raa-postgres` passes `raa-journal-tck` (claim locking and re-decision,
@@ -577,7 +579,26 @@ server wrapper, strict mode, optional local-transaction mode (journal row and a 
   cells; the 16th is the cell where that answer is true); inspect mode per kind of answer — not every row
   combination (`ActionRunnerTest`); memory repair
   (`JournalChatMemoryRepairTest`), on LangChain4j 1.14.0 and 1.23.0.
-* Not yet verified: the two-JVM Q2 variant, Q1p (pause), Q3–Q7 beyond the reference timing in the runner test.
+* Verified since 2026-11-17 (week 6, stage A): Q1p — 4 policies × 2 pause points, the paused child stopped with SIGSTOP
+  (its lease renewer with it, asserted by an unchanged lease), resumed with SIGCONT after a second child's retry
+  (`PauseTest`; a mutation that removes the record-write fencing fails the 6 fenced cells, one that refuses the
+  same-attempt late success fails the 2 `AT_MOST_ONCE` cells); Q2 in two JVMs through the runner, 2 × 32 threads
+  (`TwoJvmConcurrencyTest`; a mutation of row 5 fails it). A pause with the effect's response held
+  (`EFFECT_APPLIED_RESPONSE_HELD`) is argued from the equivalent `AFTER_RESPONSE_BEFORE_RECORD` cell, not tested
+  (revision 13).
+* Verified since 2026-11-18 (week 6, stage B): Q6 and the database faults of §9 with Toxiproxy and HikariCP configured
+  as documented (`DatabaseFaultTest`): blackhole, database down, paused container and exhausted pool return
+  `JournalUnavailable` within 3 s with no effect and nothing committed; a response lost at the claim's `COMMIT` leaves
+  the row, and the next call escalates (`AT_MOST_ONCE`) or starts attempt 2 (`IDEMPOTENT_DOWNSTREAM`); a request lost
+  there leaves nothing; a response or request lost at the record's `COMMIT` is retried and the row is `SUCCEEDED`;
+  every journal operation ends within 3 s while blackholed. `OperationTimeoutTest`: a row lock held by a frozen
+  transaction is cancelled by the database within the budget and the pooled connection survives; a budget used up
+  in the pool fails before the database is touched; a response trickling in and a large write to a database that reads
+  1 KB/s are cut off at the operation timeout. Mutations: with only a socket read timeout instead of the abort, the
+  trickle and the blocked write hang (fail at the 60 s test timeout); without any bound the blackholed claim hangs;
+  without the server-side timeouts the lock case fails by the socket; without the budget check the slow-pool case
+  claims. Q6 is shown for the documented pool settings only (ADR-0006).
+* Not yet verified: Q3–Q5 and Q7 beyond the reference timing in the runner test.
 * Desk research (not re-verified by the author): framework signatures and memory ordering
   (`docs/research/framework-integration-surface.md`), competitor behavior (`docs/research/*.md`).
 * Argued: every guarantee in §1/§2 until the §9 tests exist and pass.
@@ -714,3 +735,44 @@ call with its results together); answered calls without an id are matched by cou
 under an advisory lock. Decided by the author the same day: a lookup whose resolution cannot be written returns
 `Unknown(ASK_LATER)` ("being verified; call again later"), no longer `JournalUnavailable` ("not performed"), because
 the lookup may have found the effect; `JournalUnavailable` now means only that nothing was started.
+
+Revision 13 (2026-11-17, roadmap week 6 stage A, tests only): the pause test pauses at `AFTER_CLAIM` (the request is
+sent only after the pause) and `AFTER_RESPONSE_BEFORE_RECORD` (applied, record pending), not at
+`EFFECT_APPLIED_RESPONSE_HELD`: the paused child's HTTP timeout runs on monotonic time, which keeps running under
+SIGSTOP, so after SIGCONT the held response races the timeout, and for the journal that point equals
+`AFTER_RESPONSE_BEFORE_RECORD`. The child is paused only while its lease renewer holds no row lock (a probe with
+`FOR UPDATE NOWAIT`; a process stopped inside a renewal would keep the lock), and the retry starts only after the lease
+of the pause ran out (independent review, Claude, approve with comments, fixed the same day). Expected outcomes, derived from §6 and the SPI fencing rules: a late write of a superseded
+attempt, or onto a row already resolved by a lookup, changes 0 rows; `AT_MOST_ONCE` is the exception by N1 — the second
+caller escalates attempt 1, and the paused attempt's success of that same attempt lands (`ESCALATED` → `SUCCEEDED`);
+effects `IDEMPOTENT_DOWNSTREAM` 1, `AT_MOST_ONCE` 1, `AT_LEAST_ONCE` 2, `RECONCILABLE` 2 when paused before the request
+(lookup `NotFound`, then the paused request lands: the §8 non-guarantee) and 1 after it. `raa-testkit` gains the pause
+harness of §4 (`JvmProcess.pause/resume/send`, `FaultInjector.resumable`) and `FakeDownstream.releaseHeldResponse`. Q2 in
+two JVMs holds the first effect's response until the 63 other calls returned `InProgressElsewhere`, so all calls
+provably overlap one live attempt. Both run in every `./gradlew build` (about 1.5 minutes together), stricter than the
+nightly-only placement of the pause test in §9.1.
+
+Revision 14 (2026-11-18, roadmap week 6 stage B; decision D1 by the author, ADR-0006): the claim budget moves from
+`ReliableActions.claimTimeout` to one operation timeout of `PostgresActionJournal` (default 2.5 s) that bounds every
+journal operation, because the SPI carries no budget and record writes, renewal and the reconciler need the same bound.
+The budget starts before `getConnection()`; `statement_timeout` and `lock_timeout` are set per transaction to 80 % of
+it, so a lock held by a frozen process is normally cancelled by the database while the connection stays usable (equal
+values let `statement_timeout` fire first, which the test accepts); at the end of the budget a watchdog aborts the
+connection (`Connection.abort`), armed until the connection is closed so the pool's reset is bounded too. A first
+version set a socket read timeout before each statement instead; the independent review (Codex, request changes)
+showed that it bounds neither a blocked write nor a trickling response, nor the pool's reset after the timeout was
+restored, and tests reproducing the first two fail with it. A second independent review (Claude, request changes, fixed
+the same day): a close failing after a successful commit no longer fails the operation (logged; test with a failing
+close); the watchdog is disarmed under its lock before the connection is closed, so a late abort cannot reach a
+connection the pool has handed to another thread; to keep the close free of round trips, the isolation level is set
+transaction-locally instead of with `setTransactionIsolation`, and a connection whose rollback failed is aborted
+rather than returned with an open transaction. The trickle case also runs without a pool, and both abort cases check
+that the pool works afterwards. The two-JVM Q2 test without a pool then returned `JournalUnavailable` for some of its 64
+calls (statement timeouts on the row lock after connection set-ups had used most of the budget); its child now uses the
+recommended HikariCP pool, filled before the start, and the limitation is a consequence in ADR-0006. Pool wait and new physical connections cannot be bounded through `DataSource`; the
+README gives settings that keep Q6 (HikariCP `connectionTimeout` 1 s, `validationTimeout` 0.5 s; pgjdbc `connectTimeout`
+1 s, `loginTimeout` 2 s). Test-only dependencies: `testcontainers-toxiproxy` 2.0.5 (image `ghcr.io/shopify/toxiproxy`
+2.13.0) and HikariCP 7.1.0. A lost request is a Toxiproxy `timeout` toxic, which drops the data and keeps the connection open; the
+fault ends by disabling the proxy, which closes those connections. `DatabaseFaultTest` runs in
+every build (about 45 s), with a separate-thread test timeout because a read blocked on a dead socket ignores
+interrupts.

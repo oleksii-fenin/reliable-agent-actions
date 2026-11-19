@@ -1,8 +1,8 @@
 # reliable-agent-actions
 
 > **Status: implementation in progress, not released** (design approved 2026-11-09). Core, PostgreSQL journal,
-> reconciler, the LangChain4j adapter with chat-memory repair (tested on 1.14.0 and 1.23.0) and the process-kill test
-> through LangChain4j exist. See the verification status below the guarantees and `examples/langchain4j-refund`.
+> reconciler, the LangChain4j adapter with chat-memory repair (tested on 1.14.0 and 1.23.0), the process-kill test
+> through LangChain4j, the process-pause test and the database fault tests exist. See the verification status below the guarantees and `examples/langchain4j-refund`.
 > Working name — see [`docs/OPEN-QUESTIONS.md`](docs/OPEN-QUESTIONS.md).
 
 A small Java library that makes **side-effecting tool calls of AI agents effectively-once**. Your agent's
@@ -49,7 +49,7 @@ meaning, and an explicit rule for what to do when the outcome is unknown.
 Every row on the left is to be backed by an automated test, including a test that **kills the JVM in the middle of a
 tool call**, one that **pauses** it past its lease, and negative controls proving the harness detects duplicates.
 
-**Verification status (2026-11-16, PostgreSQL 14 and 18, plain Java caller, no LLM yet):**
+**Verification status (2026-11-18, PostgreSQL 14 and 18):**
 
 * **Verified — process kill.** A child JVM is killed with SIGKILL at four points of a tool call (after the claim; effect
   applied with the response held; response received but not recorded; recorded but not handed back) and a second JVM
@@ -67,12 +67,30 @@ tool call**, one that **pauses** it past its lease, and negative controls provin
   in PostgreSQL, is killed at the same four points and resumed either by retrying the conversation (mode (a)) or by
   repairing the memory from the journal and continuing (mode (b)); all 32 cells match the table, and in mode (b) the
   repaired answer itself is checked. Without the library the same agent refunds twice.
-* **Argued, not verified yet:** the pause past the lease (Q1p), failover behavior, overhead.
+* **Verified — pause past the lease.** A child JVM is paused with SIGSTOP inside the effect (before its request is sent,
+  or after the effect, before the record), its lease expires, a second JVM calls again, then the first is resumed
+  ([`PauseTest`](raa-postgres/src/test/java/io/github/oleksiifenin/raa/postgres/PauseTest.java), DESIGN §2 Q1p). The
+  paused attempt's late write changes nothing once a newer attempt exists or the row is already resolved by a lookup;
+  `IDEMPOTENT_DOWNSTREAM` applies the effect once (the downstream deduplicates). The non-guarantees on the right are
+  shown, not hidden: `AT_LEAST_ONCE` applies it twice, and `RECONCILABLE` does too when the paused request lands after
+  a "not found" lookup.
+* **Verified — two processes at once.** 32 threads in each of two JVMs call one action at the same moment with the
+  downstream deduplicating nothing: one effect, every other call sees the attempt in progress, later calls get the
+  recorded result ([`TwoJvmConcurrencyTest`](raa-postgres/src/test/java/io/github/oleksiifenin/raa/postgres/TwoJvmConcurrencyTest.java), Q2).
+* **Verified — database faults** with Toxiproxy between the journal and PostgreSQL and the pool settings below
+  ([`DatabaseFaultTest`](raa-postgres/src/test/java/io/github/oleksiifenin/raa/postgres/DatabaseFaultTest.java), Q6):
+  a blackholed, stopped or unreachable database and an exhausted pool give `JournalUnavailable` within 3 s, the tool
+  does not run and nothing is committed. A response lost at the claim's `COMMIT` is also `JournalUnavailable` without
+  running the tool; the next call then follows the policy (an at-most-once action is escalated, never run). A lost
+  response or request at the record's `COMMIT` is retried and the result recorded. Every journal operation ends within
+  its timeout (2.5 s) while the database is silent, trickles its response or stops reading a large write.
+* **Argued, not verified yet:** failover behavior, overhead.
 
 ## Quick start (API as implemented, not released)
 
 ```java
-// 1. Journal in your PostgreSQL (plain SQL migration shipped for Flyway/Liquibase)
+// 1. Journal in your PostgreSQL (plain SQL migration shipped for Flyway/Liquibase). Every journal operation is
+//    bounded by an operation timeout (default 2.5 s, ADR-0006); the pool must not wait longer (see below).
 ActionJournal journal = PostgresActionJournal.create(dataSource);
 
 // 2. Declare how each side-effecting tool is protected
@@ -112,6 +130,23 @@ RepairReport report = repair.repair(chatMemory);   // report.complete() == false
 // 4. Run the reconciler and the lease renewer (the Spring Boot starter will do this for you in v0.2)
 scheduler.scheduleWithFixedDelay(actions.reconciler()::runOnce, 15, 15, SECONDS);
 actions.leaseRenewer().start();
+```
+
+**Journal pool.** The library bounds every journal operation by its operation timeout, but it cannot bound the wait
+for a pooled connection or the set-up of a new one through `DataSource`. To keep "answer within 3 s when the journal
+database is down" (Q6), give the journal a pool of its own with a shorter wait. The budget also covers the wait for the row lock, so without a
+pool, or with one too small for the number of concurrent calls of one action, calls may get "journal unavailable"
+(nothing performed) instead of "already in progress". For HikariCP:
+
+```java
+HikariConfig config = new HikariConfig();
+config.setJdbcUrl(journalUrl);
+config.setMaximumPoolSize(inFlightToolCalls / 10 + 2);
+config.setConnectionTimeout(1000);                    // pool wait, below the 2.5 s operation timeout
+config.setValidationTimeout(500);
+config.addDataSourceProperty("connectTimeout", "1");  // pgjdbc, seconds
+config.addDataSourceProperty("loginTimeout", "2");
+ActionJournal journal = PostgresActionJournal.create(new HikariDataSource(config));
 ```
 
 What the model sees when the library steps in: the recorded result on replay; "already performed with different

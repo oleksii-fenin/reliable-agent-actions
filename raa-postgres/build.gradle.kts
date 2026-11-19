@@ -13,6 +13,8 @@ dependencies {
     testImplementation(project(":raa-testkit"))
     testImplementation(libs.postgresql)
     testImplementation(libs.testcontainers.postgresql)
+    testImplementation(libs.testcontainers.toxiproxy)
+    testImplementation(libs.hikaricp)
 }
 
 // PostgreSQL image for the tests; CI runs the floor (14) and the latest release (docs/DESIGN.md §7).

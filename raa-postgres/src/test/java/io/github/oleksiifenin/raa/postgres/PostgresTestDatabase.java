@@ -89,7 +89,7 @@ final class PostgresTestDatabase {
         }
     }
 
-    private static String readSchema() {
+    static String readSchema() {
         try (InputStream in = PostgresTestDatabase.class.getResourceAsStream(SCHEMA)) {
             if (in == null) {
                 throw new IllegalStateException("schema not on the class path: " + SCHEMA);
