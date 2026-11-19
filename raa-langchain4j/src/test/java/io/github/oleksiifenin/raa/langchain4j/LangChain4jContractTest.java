@@ -21,6 +21,7 @@ import dev.langchain4j.service.tool.ToolService;
 import io.github.oleksiifenin.raa.core.ActionContext;
 import io.github.oleksiifenin.raa.core.ActionKey;
 import io.github.oleksiifenin.raa.core.ActionPolicy;
+import io.github.oleksiifenin.raa.core.ActionTelemetry;
 import io.github.oleksiifenin.raa.core.ActionRejectedException;
 import io.github.oleksiifenin.raa.core.JournaledPolicy;
 import io.github.oleksiifenin.raa.core.ReliableActions;
@@ -289,7 +290,8 @@ class LangChain4jContractTest {
             throw new ToolArgumentsException(new IllegalArgumentException("amount is required"));
         };
         ReliableToolExecutor executor = new ReliableToolExecutor(rejectsArguments, specification,
-                actions(ActionPolicy.atMostOnce()).runner(), OutcomeRenderer.standard(), new ArgumentsParser());
+                actions(ActionPolicy.atMostOnce()).runner(), OutcomeRenderer.standard(), new ArgumentsParser(),
+                ActionTelemetry.none());
 
         String result = executor.execute(ToolExecutionRequest.builder().id("t1").name("refund").arguments(REFUND_ARGS)
                 .build(), "conversation-1");
@@ -317,7 +319,8 @@ class LangChain4jContractTest {
             }
         };
         ReliableToolExecutor executor = new ReliableToolExecutor(delegate, specification,
-                actions(ActionPolicy.atMostOnce()).runner(), OutcomeRenderer.standard(), new ArgumentsParser());
+                actions(ActionPolicy.atMostOnce()).runner(), OutcomeRenderer.standard(), new ArgumentsParser(),
+                ActionTelemetry.none());
         ToolExecutionRequest request = ToolExecutionRequest.builder().id("t1").name("refund").arguments(REFUND_ARGS)
                 .build();
 
@@ -415,7 +418,7 @@ class LangChain4jContractTest {
         ToolSpecification specification = ToolService.findTools(tools).stream()
                 .filter(tool -> tool.name().equals("refund")).findFirst().orElseThrow().toolSpecification();
         return new ReliableToolExecutor(delegate, specification, actions(policy).runner(), OutcomeRenderer.standard(),
-                new ArgumentsParser());
+                new ArgumentsParser(), ActionTelemetry.none());
     }
 
     private static ToolExecutionRequest refundRequest(String id) {

@@ -23,15 +23,18 @@ public final class ReliableActions {
     private final LeaseRenewer leaseRenewer;
     private final ActionRunner runner;
     private final Reconciler reconciler;
+    private final ActionTelemetry telemetry;
 
     private ReliableActions(Builder builder) {
         String owner = UUID.randomUUID().toString(); // lease owner id of this wiring
         this.policies = Map.copyOf(builder.policies);
-        this.leaseRenewer = new LeaseRenewer(builder.journal, owner, builder.lease);
-        this.runner = new ActionRunner(builder.journal, Map.copyOf(builder.policies), owner, builder.lease,
-                builder.inProgressWait, builder.recordRetryBudget, leaseRenewer, builder.storeKeyText);
-        this.reconciler = new Reconciler(builder.journal, Map.copyOf(builder.policies), Reconciler.DEFAULT_HOLD,
-                Reconciler.DEFAULT_BATCH_SIZE);
+        this.telemetry = GuardedTelemetry.guard(builder.telemetry);
+        ActionJournal journal = ObservedJournal.observe(builder.journal, telemetry);
+        this.leaseRenewer = new LeaseRenewer(journal, owner, builder.lease);
+        this.runner = new ActionRunner(journal, Map.copyOf(builder.policies), owner, builder.lease,
+                builder.inProgressWait, builder.recordRetryBudget, leaseRenewer, builder.storeKeyText, telemetry);
+        this.reconciler = new Reconciler(journal, Map.copyOf(builder.policies), Reconciler.DEFAULT_HOLD,
+                Reconciler.DEFAULT_BATCH_SIZE, telemetry);
     }
 
     /**
@@ -83,6 +86,16 @@ public final class ReliableActions {
         return reconciler;
     }
 
+    /**
+     * Returns the telemetry of this wiring, for framework adapters that report their own tool executions; failures of
+     * the application's implementation are already caught and logged.
+     *
+     * @return the telemetry, {@link ActionTelemetry#none()} by default
+     */
+    public ActionTelemetry telemetry() {
+        return telemetry;
+    }
+
     /** Collects the wiring; {@link #build()} validates every policy. */
     public static final class Builder {
 
@@ -92,6 +105,7 @@ public final class ReliableActions {
         private Duration inProgressWait = DEFAULT_IN_PROGRESS_WAIT;
         private Duration recordRetryBudget = DEFAULT_RECORD_RETRY_BUDGET;
         private boolean storeKeyText;
+        private ActionTelemetry telemetry = ActionTelemetry.none();
 
         private Builder(ActionJournal journal) {
             this.journal = Objects.requireNonNull(journal, "journal");
@@ -157,6 +171,19 @@ public final class ReliableActions {
          */
         public Builder storeKeyText(boolean storeKeyText) {
             this.storeKeyText = storeKeyText;
+            return this;
+        }
+
+        /**
+         * Sets the telemetry (docs/DESIGN.md §10), for example {@code OpenTelemetryActionTelemetry} of
+         * {@code raa-opentelemetry}; default {@link ActionTelemetry#none()}. An exception of the telemetry is logged and
+         * never changes what an action does.
+         *
+         * @param telemetry the telemetry
+         * @return this builder
+         */
+        public Builder telemetry(ActionTelemetry telemetry) {
+            this.telemetry = Objects.requireNonNull(telemetry, "telemetry");
             return this;
         }
 

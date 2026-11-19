@@ -184,7 +184,18 @@ public final class ReliableActions {
     public Reconciler reconciler();               // runOnce(); scheduled by the app (or the v0.2 starter)
     public LeaseRenewer leaseRenewer();           // start()/close(); one per process
     public ActionAdmin admin();
+    public ActionTelemetry telemetry();            // for adapters; guarded, ActionTelemetry.none() by default
 }
+public interface ActionTelemetry {               // §10; every method has a no-op default
+    static ActionTelemetry none();
+    ActionObservation startAction(ActionStart start);  // ActionStart(toolName, policy, providerCallId, keyHash hex, inspect)
+    ToolObservation startTool(String toolName, String description, String providerCallId);
+    void journalOperation(String operation, long durationNanos, boolean failed);
+    void signal(ActionSignal signal, String toolName);    // STALE_SUCCESS | LATE_RESULT_CORRECTED | LEASE_EXPIRED
+    void reconcilerResolution(ReconcilerResult result, String toolName);
+}
+// ActionObservation: claimed(verdict, state, attempt), recorded(outcome, attempt), lookedUp(result), ended(outcome),
+// failed(error); ToolObservation: ended(boolean error), failed(error). Started and ended on the calling thread.
 
 // ---- execution
 @FunctionalInterface public interface Effect { String execute(ActionContext context) throws Exception; }
@@ -245,7 +256,8 @@ public final class ReliableTools {
     public static Builder builder(ReliableActions actions);  // renderer(OutcomeRenderer), allowImmediateReturn(String...)
     public List<AiServiceTool> wrap(Object toolBean); public List<AiServiceTool> wrap(List<AiServiceTool> tools);
     // rejects tools without a policy and tools with ReturnBehavior.IMMEDIATE unless allowImmediateReturn(toolName) (§8);
-    // NONE tools are returned unchanged
+    // NONE tools are returned unchanged, or with an execute_tool observation when ReliableActions has a telemetry
+    // (§10); Builder: toolSpans(boolean = true)
 }
 public final class JournalChatMemoryRepair { public RepairReport repair(ChatMemory memory); }   // from
 //   ReliableTools.memoryRepair(List<AiServiceTool>): same renderer and argument parsing as the wrapped tools
@@ -519,14 +531,37 @@ floor and latest.
 
 ## 10. Observability
 
-* Span `reliable_action {tool}` (INTERNAL, child of the current span). Attributes: `gen_ai.tool.name`,
-  `gen_ai.tool.call.id` (if known), `raa.policy`, `raa.attempt`, `raa.outcome`, `raa.key.hash` (never the raw key).
-  Events for state transitions.
-* LangChain4j 1.23.0 emits no tool span, so the adapter can also emit `execute_tool {tool}` per the GenAI semantic
-  conventions (status *Development*; flag, default on). Spring AI has its own `spring.ai.tool` observation.
-* Metrics: `raa.actions` (counter: policy, outcome), `raa.actions.unresolved` (gauge: `UNKNOWN` + `ESCALATED`),
-  `raa.journal.duration` (histogram: operation), `raa.reconciler.resolutions` (counter: result),
-  `raa.stale_success`, `raa.late_result_corrected`, `raa.lease.expired` (counters).
+Implemented in week 6 stage C (revision 15). Core defines `ActionTelemetry` (default `none()`); `raa-opentelemetry`
+implements it on the OpenTelemetry API (`OpenTelemetryActionTelemetry.create(openTelemetry)`, wired with
+`ReliableActions.builder(...).telemetry(...)`). Core guards every hook: an exception of the telemetry is logged and
+never changes an action.
+
+* Span `reliable_action {tool}` (INTERNAL, child of the current span, current while the call runs so the tool's own
+  client spans nest under it). Attributes: `gen_ai.tool.name`, `gen_ai.tool.call.id` (if known), `raa.policy`,
+  `raa.key.hash` (never the raw key), `raa.mode` (`run`/`inspect`), at the end `raa.attempt` (last attempt the call
+  saw) and `raa.outcome` (snake case of the `ActionOutcome` type). Events `raa.claim` (verdict, state, attempt),
+  `raa.record` (record outcome, attempt), `raa.lookup` (found/not_found/unreachable) mark the state transitions.
+  `failed`, `abandoned`, `escalated`, `journal_unavailable` set status ERROR with `error.type` = the outcome. A call
+  that fails before its key exists (no policy, a key strategy that throws) is not observed; one that throws later
+  records only the exception class in `error.type` — never its message or stack trace, which may contain arguments.
+  Client spans of an outcome lookup are not children of the action span (lookups run on their own thread).
+* Span `execute_tool {tool}` from the LangChain4j adapter, after the GenAI semantic conventions (status *Development*;
+  open-telemetry/semantic-conventions-genai `docs/gen-ai/execute-tool.md`, checked 2026-11-19): `gen_ai.operation.name
+  = execute_tool`, `gen_ai.tool.name`, `gen_ai.tool.type = function`, `gen_ai.tool.call.id`, `gen_ai.tool.description`;
+  `error.type = tool_error` for a result marked as an error, the exception class for a throw. For every wrapped tool,
+  read-only (`NONE`) tools included (author, 2026-11-19); `ReliableTools.builder(...).toolSpans(false)` turns it off,
+  and without a telemetry `NONE` tools stay unchanged. An asynchronous execution of a wrapped `NONE` tool
+  (`executeAsync`, LangChain4j 1.23+) goes to the tool unchanged and is not observed. The `reliable_action` span is its child. Arguments, results
+  and the conversation id are not recorded (personal data). Spring AI has its own `spring.ai.tool` observation.
+* Metrics: `raa.actions` (counter of run calls, not inspections: `raa.policy`, `raa.outcome`; `exception` for a
+  call that threw), `raa.journal.duration`
+  (histogram in seconds, explicit millisecond-range buckets: `raa.journal.operation`, `error.type = journal_error` for a
+  `JournalException`; measured by a core decorator of the journal with a monotonic clock that never takes part in a decision),
+  `raa.reconciler.resolutions` (counter: `raa.result`, `gen_ai.tool.name`), `raa.stale_success`,
+  `raa.late_result_corrected`, `raa.lease.expired` (counters: `gen_ai.tool.name`; a lease expiry is counted when the
+  reconciler moves the row to `UNKNOWN` or a claim applies row 6). `raa.actions.unresolved` (gauge: `UNKNOWN` +
+  `ESCALATED`) needs a count the storage SPI does not have; it comes with `ActionAdmin` in week 7 (author,
+  2026-11-19).
 * Hashes of low-entropy values (an order id) are reversible by enumeration; `redact()` removes result/arguments/key
   text, keyed hashing (HMAC with an installation secret) is a v0.2 candidate.
 
@@ -559,7 +594,7 @@ server wrapper, strict mode, optional local-transaction mode (journal row and a 
 | Framework API churn | adapter breaks | public APIs only, floor+latest CI matrix, weekly scheduled build |
 | Schedule (8–12 h/week) | v0.1 slips | stage gates; week 3 alone is a demonstrable result |
 
-## 13. Verified vs argued (as of 2026-11-18)
+## 13. Verified vs argued (as of 2026-11-19)
 
 * Verified by executed tests (`./gradlew build`, PostgreSQL 14 and 18): the §6 decision table per row and policy;
   key canonicalization; policy validation; `raa-postgres` passes `raa-journal-tck` (claim locking and re-decision,
@@ -598,7 +633,15 @@ server wrapper, strict mode, optional local-transaction mode (journal row and a 
   trickle and the blocked write hang (fail at the 60 s test timeout); without any bound the blackholed claim hangs;
   without the server-side timeouts the lock case fails by the socket; without the budget check the slow-pool case
   claims. Q6 is shown for the documented pool settings only (ADR-0006).
-* Not yet verified: Q3–Q5 and Q7 beyond the reference timing in the runner test.
+* Verified since 2026-11-19 (week 6, stage C): R8 except the unresolved gauge — the spans, events and metrics of §10
+  through the OpenTelemetry SDK with in-memory exporters (`OpenTelemetryActionTelemetryTest`: parent and current span,
+  attributes, error status, counters, the journal histogram, lease expiry, stale success, `execute_tool` with the action
+  span inside); the hooks the runtime calls and that a throwing telemetry changes nothing (`ActionTelemetryTest`); the
+  adapter's `execute_tool` observations for journaled and read-only tools and the `toolSpans(false)` switch
+  (`ToolSpansTest`). Mutations: a span not made current fails the parent/current assertions; a guard that lets
+  exceptions through fails the throwing-telemetry test.
+* Not yet verified: Q3–Q5 and Q7 beyond the reference timing in the runner test; the `raa.actions.unresolved` gauge
+  (week 7).
 * Desk research (not re-verified by the author): framework signatures and memory ordering
   (`docs/research/framework-integration-surface.md`), competitor behavior (`docs/research/*.md`).
 * Argued: every guarantee in §1/§2 until the §9 tests exist and pass.
@@ -769,7 +812,22 @@ transaction-locally instead of with `setTransactionIsolation`, and a connection 
 rather than returned with an open transaction. The trickle case also runs without a pool, and both abort cases check
 that the pool works afterwards. The two-JVM Q2 test without a pool then returned `JournalUnavailable` for some of its 64
 calls (statement timeouts on the row lock after connection set-ups had used most of the budget); its child now uses the
-recommended HikariCP pool, filled before the start, and the limitation is a consequence in ADR-0006. Pool wait and new physical connections cannot be bounded through `DataSource`; the
+recommended HikariCP pool, filled before the start, and the limitation is a consequence in ADR-0006.
+
+Revision 15 (2026-11-19, roadmap week 6 stage C; author's decisions the same day): telemetry as §10 describes it.
+`ActionTelemetry` (core, no-op defaults, guarded by core) with `ActionObservation`/`ToolObservation`; a journal
+decorator in core reports operation durations; a lease expiry by a claim is detected from the row state the decider saw
+(row 6 applied), because with `AT_LEAST_ONCE`/`IDEMPOTENT_DOWNSTREAM` the claim starts the next attempt directly and
+writes no `UNKNOWN`. `raa-opentelemetry` depends on core and `opentelemetry-api` 1.68.0 only (no BOM forced on the
+application). Decided by the author: the `raa.actions.unresolved` gauge moves to week 7 with `ActionAdmin` (it needs a
+count from storage); the LangChain4j adapter emits `execute_tool` in this stage, for read-only tools too, switchable
+with `toolSpans(false)`. Independent review (Claude, request changes; Codex was at its usage limit), fixed the same day:
+wrapping a read-only tool kept only the synchronous path, so `ObservedToolExecutor` passes `executeAsync` through (no
+`@Override`, so it compiles against the 1.14.0 floor); the lease-expiry signal now comes from the write a claim applied
+from `EXECUTING` (only row 6 writes there), because row 6 followed by row 7 is a conflict that still moves the row to
+`UNKNOWN`; spans end in `finally` and the guard ends an observation at most once and also catches linkage errors (a
+telemetry library missing from the class path); exceptions record their type only; `journal_error` only for
+`JournalException`. Pool wait and new physical connections cannot be bounded through `DataSource`; the
 README gives settings that keep Q6 (HikariCP `connectionTimeout` 1 s, `validationTimeout` 0.5 s; pgjdbc `connectTimeout`
 1 s, `loginTimeout` 2 s). Test-only dependencies: `testcontainers-toxiproxy` 2.0.5 (image `ghcr.io/shopify/toxiproxy`
 2.13.0) and HikariCP 7.1.0. A lost request is a Toxiproxy `timeout` toxic, which drops the data and keeps the connection open; the

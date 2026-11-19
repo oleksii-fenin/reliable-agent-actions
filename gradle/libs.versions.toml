@@ -5,6 +5,8 @@ postgresql = "42.7.14"
 testcontainers = "2.0.5"
 # Test only: the pool of the database fault tests (Q6, ADR-0006). Latest release checked 2026-11-18 (Maven Central).
 hikaricp = "7.1.0"
+# OpenTelemetry Java API for raa-opentelemetry; latest release checked 2026-11-19 (Maven Central, 1.68.0 of 2026-11-06).
+opentelemetry = "1.68.0"
 # Floor of the supported range (ADR-0002: findTools + tools(List<AiServiceTool>)); the adapter compiles against it.
 langchain4j-floor = "1.14.0"
 # Latest release checked 2026-11-16 (Maven Central); the default for the adapter tests.
@@ -19,5 +21,7 @@ postgresql = { module = "org.postgresql:postgresql", version.ref = "postgresql" 
 testcontainers-postgresql = { module = "org.testcontainers:testcontainers-postgresql", version.ref = "testcontainers" }
 testcontainers-toxiproxy = { module = "org.testcontainers:testcontainers-toxiproxy", version.ref = "testcontainers" }
 hikaricp = { module = "com.zaxxer:HikariCP", version.ref = "hikaricp" }
+opentelemetry-api = { module = "io.opentelemetry:opentelemetry-api", version.ref = "opentelemetry" }
+opentelemetry-sdk-testing = { module = "io.opentelemetry:opentelemetry-sdk-testing", version.ref = "opentelemetry" }
 junit-jupiter-api = { module = "org.junit.jupiter:junit-jupiter-api" }
 langchain4j-floor = { module = "dev.langchain4j:langchain4j", version.ref = "langchain4j-floor" }

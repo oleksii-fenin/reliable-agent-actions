@@ -8,5 +8,6 @@ include(
     "raa-journal-tck",
     "raa-testkit",
     "raa-langchain4j",
+    "raa-opentelemetry",
     "examples:langchain4j-refund",
 )

@@ -39,7 +39,11 @@ public final class Reconciler {
     private final int batchSize;
     private final TimedLookup timedLookup = new TimedLookup();
 
-    Reconciler(ActionJournal journal, Map<String, ActionPolicy> policies, Duration hold, int batchSize) {
+    private final ActionTelemetry telemetry;
+
+    Reconciler(ActionJournal journal, Map<String, ActionPolicy> policies, Duration hold, int batchSize,
+            ActionTelemetry telemetry) {
+        this.telemetry = Objects.requireNonNull(telemetry, "telemetry");
         this.journal = Objects.requireNonNull(journal, "journal");
         this.policies = Objects.requireNonNull(policies, "policies");
         this.hold = Objects.requireNonNull(hold, "hold");
@@ -81,15 +85,18 @@ public final class Reconciler {
         switch (row.state()) {
             case EXECUTING:
                 // The next batch takes the row as UNKNOWN: markUnknownIfLeaseExpired sets resolve_after = now.
-                journal.markUnknownIfLeaseExpired(row.keyHash(), row.attempt(),
-                        "the lease expired; the process running the attempt is presumed dead");
+                if (journal.markUnknownIfLeaseExpired(row.keyHash(), row.attempt(),
+                        "the lease expired; the process running the attempt is presumed dead")) {
+                    telemetry.signal(ActionSignal.LEASE_EXPIRED, row.toolName());
+                    telemetry.reconcilerResolution(ReconcilerResult.MARKED_UNKNOWN, row.toolName());
+                }
                 return;
             case UNKNOWN:
                 unknown(row, journaled, now, deadlinePassed);
                 return;
             case FAILED:
                 if (deadlinePassed) {
-                    journal.resolve(row.keyHash(), row.attempt(), new Resolution.Abandon("the deadline passed"));
+                    resolve(row, new Resolution.Abandon("the deadline passed"));
                 }
                 return;
             default:
@@ -102,7 +109,7 @@ public final class Reconciler {
         if (key == null) {
             // Rows 10/11 without a usable lookup: at-most-once is never retried, others wait for a call or the deadline.
             if (policy instanceof AtMostOnce && policy.lookup().isEmpty() || deadlinePassed) {
-                journal.resolve(row.keyHash(), row.attempt(), new Resolution.Escalate(policy.lookup().isPresent()
+                resolve(row, new Resolution.Escalate(policy.lookup().isPresent()
                         ? "the outcome could not be looked up (no key text stored) before the deadline"
                         : "the outcome is unknown and the tool has no outcome lookup"));
             }
@@ -117,7 +124,27 @@ public final class Reconciler {
         if (result == null) {
             return; // interrupted; runOnce stops and the row is taken again after the hold
         }
-        journal.resolve(row.keyHash(), row.attempt(), resolution(row, policy, result, deadlinePassed));
+        resolve(row, resolution(row, policy, result, deadlinePassed));
+    }
+
+    /** Writes a resolution and reports it if it landed. */
+    private void resolve(ActionRecord row, Resolution resolution) {
+        if (journal.resolve(row.keyHash(), row.attempt(), resolution)) {
+            telemetry.reconcilerResolution(resultOf(resolution), row.toolName());
+        }
+    }
+
+    private static ReconcilerResult resultOf(Resolution resolution) {
+        if (resolution instanceof Resolution.Applied) {
+            return ReconcilerResult.APPLIED;
+        }
+        if (resolution instanceof Resolution.NotApplied) {
+            return ReconcilerResult.NOT_APPLIED;
+        }
+        if (resolution instanceof Resolution.LookupUnreachable) {
+            return ReconcilerResult.LOOKUP_UNREACHABLE;
+        }
+        return resolution instanceof Resolution.Escalate ? ReconcilerResult.ESCALATED : ReconcilerResult.ABANDONED;
     }
 
     private static Resolution resolution(ActionRecord row, JournaledPolicy<?> policy, LookupResult result,

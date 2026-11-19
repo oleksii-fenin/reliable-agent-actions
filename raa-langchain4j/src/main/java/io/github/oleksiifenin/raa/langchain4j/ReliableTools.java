@@ -5,6 +5,7 @@ import dev.langchain4j.agent.tool.ToolSpecification;
 import dev.langchain4j.service.tool.AiServiceTool;
 import dev.langchain4j.service.tool.ToolService;
 import io.github.oleksiifenin.raa.core.ActionPolicy;
+import io.github.oleksiifenin.raa.core.ActionTelemetry;
 import io.github.oleksiifenin.raa.core.JournaledPolicy;
 import io.github.oleksiifenin.raa.core.ReliableActions;
 import java.util.ArrayList;
@@ -19,7 +20,10 @@ import java.util.Set;
 /**
  * Wires LangChain4j tools through the action journal (ADR-0002): {@code .tools(ReliableTools.wrap(bean, actions))}
  * instead of {@code .tools(bean)}. Each tool keeps its specification and {@link ReturnBehavior}; tools whose policy is
- * {@link ActionPolicy#none()} stay as they are; every other tool gets a {@link ReliableToolExecutor}.
+ * {@link ActionPolicy#none()} run as they are; every other tool gets a {@link ReliableToolExecutor}. With a
+ * telemetry in {@link ReliableActions} ({@code ReliableActions.Builder.telemetry}), every tool execution, read-only
+ * ones included, is also reported as an {@code execute_tool} observation; {@link Builder#toolSpans(boolean)} turns
+ * that off. Without a telemetry, read-only tools are returned unchanged.
  *
  * <p>Wiring fails, before the model can call anything, for a tool without a policy in {@link ReliableActions} and for
  * a journaled tool with {@link ReturnBehavior#IMMEDIATE}: its result would be the final answer to the user, and the
@@ -32,9 +36,11 @@ public final class ReliableTools {
     private final OutcomeRenderer renderer;
     private final Set<String> immediateReturnAllowed;
     private final ArgumentsParser parser = new ArgumentsParser();
+    private final ActionTelemetry toolTelemetry;
 
     private ReliableTools(Builder builder) {
         this.actions = builder.actions;
+        this.toolTelemetry = builder.toolSpans ? builder.actions.telemetry() : ActionTelemetry.none();
         this.renderer = builder.renderer;
         this.immediateReturnAllowed = Set.copyOf(builder.immediateReturnAllowed);
     }
@@ -111,7 +117,12 @@ public final class ReliableTools {
                 + " has no policy; declare one with ReliableActions.builder(...).tool(\"" + name + "\", ...), or"
                 + " ActionPolicy.none() for a read-only tool"));
         if (!(policy instanceof JournaledPolicy<?>)) {
-            return tool; // read-only: called directly
+            if (toolTelemetry == ActionTelemetry.none()) {
+                return tool; // read-only: called directly
+            }
+            return tool.toBuilder()
+                    .toolExecutor(new ObservedToolExecutor(tool.toolExecutor(), tool.toolSpecification(), toolTelemetry))
+                    .build();
         }
         if (tool.returnBehavior() == ReturnBehavior.IMMEDIATE && !immediateReturnAllowed.contains(name)) {
             throw new IllegalStateException("tool " + name + " returns immediately to the user, so texts such as"
@@ -120,7 +131,7 @@ public final class ReliableTools {
         }
         return tool.toBuilder()
                 .toolExecutor(new ReliableToolExecutor(tool.toolExecutor(), tool.toolSpecification(),
-                        actions.runner(), renderer, parser))
+                        actions.runner(), renderer, parser, toolTelemetry))
                 .build();
     }
 
@@ -130,6 +141,7 @@ public final class ReliableTools {
         private final ReliableActions actions;
         private OutcomeRenderer renderer = OutcomeRenderer.standard();
         private final Set<String> immediateReturnAllowed = new HashSet<>();
+        private boolean toolSpans = true;
 
         private Builder(ReliableActions actions) {
             this.actions = Objects.requireNonNull(actions, "actions");
@@ -154,6 +166,19 @@ public final class ReliableTools {
          */
         public Builder allowImmediateReturn(String... toolNames) {
             immediateReturnAllowed.addAll(Arrays.asList(toolNames)); // rejects null names
+            return this;
+        }
+
+        /**
+         * Reports every tool execution as an {@code execute_tool} observation of the telemetry of
+         * {@link ReliableActions} (the GenAI semantic conventions' tool span); default {@code true}. Turn it off when
+         * another instrumentation already records tool executions. Without a telemetry it has no effect.
+         *
+         * @param toolSpans whether to report tool executions
+         * @return this builder
+         */
+        public Builder toolSpans(boolean toolSpans) {
+            this.toolSpans = toolSpans;
             return this;
         }
 

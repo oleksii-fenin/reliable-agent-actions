@@ -2,7 +2,7 @@
 
 > **Status: implementation in progress, not released** (design approved 2026-11-09). Core, PostgreSQL journal,
 > reconciler, the LangChain4j adapter with chat-memory repair (tested on 1.14.0 and 1.23.0), the process-kill test
-> through LangChain4j, the process-pause test and the database fault tests exist. See the verification status below the guarantees and `examples/langchain4j-refund`.
+> through LangChain4j, the process-pause test, the database fault tests and OpenTelemetry spans and metrics exist. See the verification status below the guarantees and `examples/langchain4j-refund`.
 > Working name — see [`docs/OPEN-QUESTIONS.md`](docs/OPEN-QUESTIONS.md).
 
 A small Java library that makes **side-effecting tool calls of AI agents effectively-once**. Your agent's
@@ -49,7 +49,7 @@ meaning, and an explicit rule for what to do when the outcome is unknown.
 Every row on the left is to be backed by an automated test, including a test that **kills the JVM in the middle of a
 tool call**, one that **pauses** it past its lease, and negative controls proving the harness detects duplicates.
 
-**Verification status (2026-11-18, PostgreSQL 14 and 18):**
+**Verification status (2026-11-19, PostgreSQL 14 and 18):**
 
 * **Verified — process kill.** A child JVM is killed with SIGKILL at four points of a tool call (after the claim; effect
   applied with the response held; response received but not recorded; recorded but not handed back) and a second JVM
@@ -84,6 +84,10 @@ tool call**, one that **pauses** it past its lease, and negative controls provin
   running the tool; the next call then follows the policy (an at-most-once action is escalated, never run). A lost
   response or request at the record's `COMMIT` is retried and the result recorded. Every journal operation ends within
   its timeout (2.5 s) while the database is silent, trickles its response or stops reading a large write.
+* **Verified — observability** through the OpenTelemetry SDK with in-memory exporters: one `reliable_action` span
+  per call (child of the current span, with policy, key hash, attempt and outcome; state transitions as events), the
+  `execute_tool` span of the GenAI conventions around it, and the counters and journal-duration histogram; a telemetry
+  that throws never changes an action. The gauge of unresolved actions comes with the operator API (week 7).
 * **Argued, not verified yet:** failover behavior, overhead.
 
 ## Quick start (API as implemented, not released)
@@ -126,6 +130,10 @@ String refundOrder(long orderId, BigDecimal amount) {
 // After a restart, answer tool calls the crash left without a result, before the next message of a conversation:
 JournalChatMemoryRepair repair = reliableTools.memoryRepair(tools);
 RepairReport report = repair.repair(chatMemory);   // report.complete() == false: an attempt is still running
+
+// Optional: OpenTelemetry spans and metrics (module raa-opentelemetry), on the builder of step 2:
+//     .telemetry(OpenTelemetryActionTelemetry.create(openTelemetry))
+// Every wrapped tool then also gets an execute_tool span; ReliableTools.builder(actions).toolSpans(false) turns it off.
 
 // 4. Run the reconciler and the lease renewer (the Spring Boot starter will do this for you in v0.2)
 scheduler.scheduleWithFixedDelay(actions.reconciler()::runOnce, 15, 15, SECONDS);

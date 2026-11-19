@@ -11,6 +11,7 @@ import dev.langchain4j.service.tool.ToolExecutor;
 import io.github.oleksiifenin.raa.core.ActionOutcome;
 import io.github.oleksiifenin.raa.core.ActionRejectedException;
 import io.github.oleksiifenin.raa.core.ActionRunner;
+import io.github.oleksiifenin.raa.core.ActionTelemetry;
 import io.github.oleksiifenin.raa.core.Effect;
 import io.github.oleksiifenin.raa.core.ToolCall;
 import java.util.Map;
@@ -32,6 +33,10 @@ import java.util.function.Supplier;
  * exception of the tool reaches the policy's failure classifier as the tool threw it. A tool result marked as an error
  * counts as an exception after the effect may have started.
  *
+ * <p><b>Telemetry.</b> Each execution is reported as an {@code execute_tool} observation
+ * ({@link ActionTelemetry#startTool}) around the action's own observation, unless
+ * {@link ReliableTools.Builder#toolSpans(boolean)} turned it off.
+ *
  * <p><b>Asynchronous execution</b> is not supported in v0.1: {@code executeAsync} is inherited, which on LangChain4j
  * versions that have it completes exceptionally without running the tool.
  */
@@ -45,9 +50,11 @@ public final class ReliableToolExecutor implements ToolExecutor {
     private final ActionRunner runner;
     private final OutcomeRenderer renderer;
     private final ArgumentsParser parser;
+    private final ActionTelemetry telemetry;
 
     ReliableToolExecutor(ToolExecutor delegate, ToolSpecification specification, ActionRunner runner,
-            OutcomeRenderer renderer, ArgumentsParser parser) {
+            OutcomeRenderer renderer, ArgumentsParser parser, ActionTelemetry telemetry) {
+        this.telemetry = Objects.requireNonNull(telemetry, "telemetry");
         this.delegate = Objects.requireNonNull(delegate, "delegate");
         this.specification = Objects.requireNonNull(specification, "specification");
         this.runner = Objects.requireNonNull(runner, "runner");
@@ -58,13 +65,15 @@ public final class ReliableToolExecutor implements ToolExecutor {
     @Override
     public ToolExecutionResult executeWithContext(ToolExecutionRequest request, InvocationContext context) {
         Object memoryId = context == null ? null : context.chatMemoryId();
-        return run(request, memoryId, () -> delegate.executeWithContext(request, context));
+        return ObservedToolExecutor.observe(telemetry, specification, request,
+                () -> run(request, memoryId, () -> delegate.executeWithContext(request, context)));
     }
 
     @Override
     public String execute(ToolExecutionRequest request, Object memoryId) {
-        return run(request, memoryId, () -> ToolExecutionResult.builder()
-                .resultText(delegate.execute(request, memoryId)).build()).resultText();
+        return ObservedToolExecutor.observe(telemetry, specification, request,
+                () -> run(request, memoryId, () -> ToolExecutionResult.builder()
+                        .resultText(delegate.execute(request, memoryId)).build())).resultText();
     }
 
     private ToolExecutionResult run(ToolExecutionRequest request, Object memoryId,

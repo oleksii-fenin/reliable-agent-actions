@@ -8,6 +8,9 @@ import io.github.oleksiifenin.raa.storage.CallRecord;
 import io.github.oleksiifenin.raa.storage.ClaimRequest;
 import io.github.oleksiifenin.raa.storage.ClaimResult;
 import io.github.oleksiifenin.raa.storage.FailureKind;
+import io.github.oleksiifenin.raa.storage.ClaimDecider;
+import io.github.oleksiifenin.raa.storage.ClaimDecision;
+import io.github.oleksiifenin.raa.storage.JournalWrite;
 import io.github.oleksiifenin.raa.storage.JournalException;
 import io.github.oleksiifenin.raa.storage.KeyAttempt;
 import io.github.oleksiifenin.raa.storage.RecordOutcome;
@@ -17,10 +20,12 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HexFormat;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
@@ -56,10 +61,13 @@ public final class ActionRunner {
     private final boolean storeKeyText;
     private final ArgumentsHasher hasher = new ArgumentsHasher();
     private final TimedLookup timedLookup = new TimedLookup();
+    private final ActionTelemetry telemetry;
 
     ActionRunner(ActionJournal journal, Map<String, ActionPolicy> policies, String owner, Duration lease,
-            Duration inProgressWait, Duration recordRetryBudget, LeaseRenewer leaseRenewer, boolean storeKeyText) {
+            Duration inProgressWait, Duration recordRetryBudget, LeaseRenewer leaseRenewer, boolean storeKeyText,
+            ActionTelemetry telemetry) {
         this.journal = journal;
+        this.telemetry = telemetry;
         this.storeKeyText = storeKeyText;
         this.policies = policies;
         this.owner = owner;
@@ -86,7 +94,8 @@ public final class ActionRunner {
     public ActionOutcome run(ToolCall call, Effect effect) {
         Objects.requireNonNull(effect, "effect");
         Prepared prepared = prepare(call, call.providerCallId());
-        return prepared.failure != null ? prepared.failure : new Execution(prepared, effect).run();
+        return observed(call, prepared, false, observation -> prepared.failure != null
+                ? prepared.failure : new Execution(prepared, effect, observation).run());
     }
 
     /**
@@ -111,6 +120,10 @@ public final class ActionRunner {
             throw new IllegalArgumentException("inspect needs the provider tool-call id of the call");
         }
         Prepared prepared = prepare(call, null); // the claim must not touch the call history
+        return observed(call, prepared, true, observation -> inspectPrepared(call, prepared, observation));
+    }
+
+    private ActionOutcome inspectPrepared(ToolCall call, Prepared prepared, ActionObservation observation) {
         if (prepared.failure != null) {
             return prepared.failure;
         }
@@ -123,12 +136,29 @@ public final class ActionRunner {
                 throw new IllegalStateException("call " + call.providerCallId() + " of tool " + call.toolName()
                         + " claimed another action than its arguments give now (has the key strategy changed?)");
             }
-            return new Execution(prepared, null).run();
+            return new Execution(prepared, null, observation).run();
         } catch (JournalException e) {
             return new ActionOutcome.JournalUnavailable(message(e));
         } catch (InspectDecider.NoActionRowException e) {
             return new ActionOutcome.Failed(NOT_STARTED, true);
         }
+    }
+
+    /** Runs a call inside its telemetry observation (docs/DESIGN.md §10), ended exactly once. */
+    private ActionOutcome observed(ToolCall call, Prepared prepared, boolean inspect,
+            Function<ActionObservation, ActionOutcome> body) {
+        ActionObservation observation = telemetry.startAction(new ActionStart(call.toolName(),
+                prepared.policy.journalName(), call.providerCallId(),
+                prepared.key == null ? null : HexFormat.of().formatHex(prepared.key.hash()), inspect));
+        ActionOutcome outcome;
+        try {
+            outcome = body.apply(observation);
+        } catch (RuntimeException | Error e) {
+            observation.failed(e);
+            throw e;
+        }
+        observation.ended(outcome);
+        return outcome;
     }
 
     /** The answer of inspect mode for a call that started nothing. */
@@ -154,13 +184,13 @@ public final class ActionRunner {
             hashes = hasher.hash(call.arguments(), journaled.freeTextArguments());
         } catch (IllegalArgumentException e) {
             // Nothing was claimed or performed; the model may correct the arguments.
-            return Prepared.failed(new ActionOutcome.Failed("invalid arguments: " + message(e), true));
+            return Prepared.failed(journaled, new ActionOutcome.Failed("invalid arguments: " + message(e), true));
         } catch (NullPointerException e) {
             // A null key component, typically a call without a scope. Not performed either; logged with its stack
             // trace, because it can also be a bug in the key strategy.
             LOG.log(System.Logger.Level.WARNING, "the key strategy of tool " + call.toolName() + " failed with a null"
                     + " value; the call is not performed", e);
-            return Prepared.failed(new ActionOutcome.Failed("invalid arguments: " + message(e), true));
+            return Prepared.failed(journaled, new ActionOutcome.Failed("invalid arguments: " + message(e), true));
         }
         ClaimRequest request = new ClaimRequest(key.hash(), key.scopeHash(), keyText(key), call.toolName(),
                 journaled.journalName(), hashes.material(), hashes.all(), null, providerCallId, owner, lease,
@@ -185,8 +215,8 @@ public final class ActionRunner {
             this.failure = failure;
         }
 
-        static Prepared failed(ActionOutcome failure) {
-            return new Prepared(null, null, null, null, failure);
+        static Prepared failed(JournaledPolicy<?> policy, ActionOutcome failure) {
+            return new Prepared(policy, null, null, null, failure);
         }
     }
 
@@ -212,6 +242,7 @@ public final class ActionRunner {
         private final ActionKey key;
         private final ClaimRequest request;
         private final Effect effect;
+        private final ActionObservation observation;
         /** Inspect mode: no effect, no attempt started, no waiting for a live lease. */
         private final boolean inspect;
         private DecisionTable table;
@@ -221,7 +252,8 @@ public final class ActionRunner {
         private long pollPauseNanos;
 
         /** {@code effect == null} means inspect mode. */
-        Execution(Prepared prepared, Effect effect) {
+        Execution(Prepared prepared, Effect effect, ActionObservation observation) {
+            this.observation = observation;
             this.policy = prepared.policy;
             this.table = prepared.table;
             this.key = prepared.key;
@@ -234,12 +266,19 @@ public final class ActionRunner {
             int settleRounds = 0;
             while (true) {
                 ClaimResult claim;
+                StateSeen decider = new StateSeen(inspect ? new InspectDecider(table) : table);
                 try {
-                    claim = journal.claim(request, inspect ? new InspectDecider(table) : table);
+                    claim = journal.claim(request, decider);
                 } catch (JournalException e) {
                     return new ActionOutcome.JournalUnavailable(message(e));
                 }
                 ActionRecord row = claim.record();
+                observation.claimed(claim.decision().verdict(), row.state(), row.attempt());
+                // From EXECUTING only row 6 (lease expired) writes; rows 4 and 5 write nothing.
+                if (decider.before == ActionState.EXECUTING
+                        && !(claim.decision().write() instanceof JournalWrite.None)) {
+                    telemetry.signal(ActionSignal.LEASE_EXPIRED, request.toolName());
+                }
                 switch (claim.decision().verdict()) {
                     case START:
                         return execute(row.attempt());
@@ -323,13 +362,16 @@ public final class ActionRunner {
             RecordResult result = withRecordRetries(
                     () -> journal.recordSuccess(request.keyHash(), attempt, recordedText), attempt);
             if (result != null) {
+                observation.recorded(result.outcome(), attempt);
                 if (result.outcome() == RecordOutcome.SUPERSEDED) {
+                    telemetry.signal(ActionSignal.STALE_SUCCESS, request.toolName());
                     LOG.log(System.Logger.Level.INFO, "stale success: attempt {0} of tool {1} finished after a newer"
                             + " attempt started", attempt, request.toolName());
                 }
                 ActionState before = result.stateBefore().orElse(null);
                 if (result.outcome() == RecordOutcome.APPLIED
                         && (before == ActionState.FAILED || before == ActionState.ABANDONED)) {
+                    telemetry.signal(ActionSignal.LATE_RESULT_CORRECTED, request.toolName());
                     LOG.log(System.Logger.Level.WARNING, "late result corrected: attempt {0} of tool {1} succeeded"
                             + " after its row was {2}", attempt, request.toolName(), before);
                 }
@@ -344,6 +386,9 @@ public final class ActionRunner {
             String recordedError = storable(errorText);
             RecordResult result = withRecordRetries(
                     () -> journal.recordFailure(request.keyHash(), attempt, kind, recordedError), attempt);
+            if (result != null) {
+                observation.recorded(result.outcome(), attempt);
+            }
             if (result != null && result.outcome() == RecordOutcome.ALREADY_SUCCEEDED) {
                 ActionRecord row = result.record().orElseThrow();
                 return new ActionOutcome.Replayed(textOf(row), row.updatedAt(), false);
@@ -461,6 +506,8 @@ public final class ActionRunner {
                 // Interrupted while waiting: the downstream did not fail, so nothing is written and nothing starts.
                 return interruptedBeforeVerification();
             }
+            observation.lookedUp(result instanceof LookupResult.Found ? "found"
+                    : result instanceof LookupResult.NotFound ? "not_found" : "unreachable");
             Resolution resolution;
             if (result instanceof LookupResult.Found) {
                 resolution = new Resolution.Applied(storable(((LookupResult.Found) result).resultText()));
@@ -507,6 +554,24 @@ public final class ActionRunner {
                     : windowOpens;
             // At the deadline row 8 looks up regardless of a backoff, so no caller needs to wait longer.
             return (after.isAfter(row.deadlineAt()) ? row.deadlineAt() : after).toString();
+        }
+    }
+
+    /** Remembers the row state the applied decision saw (the last round of a claim). */
+    private static final class StateSeen implements ClaimDecider {
+
+        private final ClaimDecider delegate;
+        private ActionState before;
+
+        StateSeen(ClaimDecider delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public ClaimDecision decide(ClaimRequest request, Optional<ActionRecord> current, Instant now) {
+            ClaimDecision decision = delegate.decide(request, current, now);
+            before = current.map(ActionRecord::state).orElse(null);
+            return decision;
         }
     }
 
