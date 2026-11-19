@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The nightly workflow runs the same matrix (nightly.yml).
+  workflow_call:
 
 permissions:
   contents: read

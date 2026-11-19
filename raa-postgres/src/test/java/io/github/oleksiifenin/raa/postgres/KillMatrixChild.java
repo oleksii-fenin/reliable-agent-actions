@@ -16,6 +16,7 @@ import io.github.oleksiifenin.raa.testkit.FakeDownstream;
 import io.github.oleksiifenin.raa.testkit.FaultInjector;
 import io.github.oleksiifenin.raa.testkit.FaultPoint;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.math.BigDecimal;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -29,6 +30,8 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.LockSupport;
 import java.util.regex.Matcher;
@@ -49,6 +52,8 @@ public final class KillMatrixChild {
 
     /** Prefix of the line with the final outcome: {@code RAA-FINAL<TAB>type<TAB>fromLookup<TAB>text<TAB>calls}. */
     static final String FINAL = "RAA-FINAL";
+    /** Printed by {@code random-first} right before the call; the randomized kill counts its delay from here. */
+    static final String CALLING = "RAA-CALLING";
 
     static final Duration LEASE = Duration.ofSeconds(2);
     static final Duration MAX_EFFECT = Duration.ofSeconds(3);
@@ -92,6 +97,12 @@ public final class KillMatrixChild {
             case "resume":
                 child.resume();
                 break;
+            case "random-first":
+                child.randomFirst();
+                break;
+            case "random-resume":
+                child.randomResume();
+                break;
             case "bypass-first":
                 child.bypassFirst();
                 break;
@@ -113,11 +124,64 @@ public final class KillMatrixChild {
         printFinal(outcome, 1);
     }
 
+    /**
+     * Like {@code first}, but announces the call so that the parent can kill it at a random moment. A call of another
+     * action first loads the classes and opens the paths (journal, runner), so that the announced call takes about as
+     * long as in a warm process; its effect does not reach the downstream.
+     */
+    private void randomFirst() {
+        ReliableActions actions = actions(PostgresActionJournal.create(dataSource));
+        actions.leaseRenewer().start();
+        Map<String, Object> warmUp = Map.of("orderId", "warm-up", "amount", new BigDecimal("1"));
+        actions.runner().run(new ToolCall(TOOL, warmUp.toString(), warmUp, "warm-up", scope), context -> "warm");
+        try { // the HTTP client too: a lookup request, which applies nothing
+            http.send(HttpRequest.newBuilder(URI.create(downstream + "/effects/warm-up")).timeout(HTTP_TIMEOUT).GET()
+                    .build(), HttpResponse.BodyHandlers.discarding());
+        } catch (IOException e) {
+            throw new UncheckedIOException("warm-up request failed", e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(e);
+        }
+        System.out.println(CALLING);
+        System.out.flush();
+        ActionOutcome outcome = actions.runner().run(call(FIRST_CALL_ID), effect());
+        printFinal(outcome, 1);
+    }
+
     private void resume() {
         ActionJournal journal = PostgresActionJournal.create(dataSource);
         ActionRecord first = journal.findByProviderCallId(key().scopeHash(), FIRST_CALL_ID).orElseThrow().action();
         awaitDatabaseTime(first.startedAt().plus(MAX_EFFECT).plus(RESUME_MARGIN));
+        callAgain(actions(journal));
+    }
+
+    /**
+     * Resumes after a kill at a random moment: the first call may have claimed nothing (killed before its claim
+     * committed), and the reconciler runs in the background meanwhile (docs/DESIGN.md §9.1, randomized job).
+     */
+    private void randomResume() {
+        ActionJournal journal = PostgresActionJournal.create(dataSource);
+        journal.findByProviderCallId(key().scopeHash(), FIRST_CALL_ID).ifPresent(first ->
+                awaitDatabaseTime(first.action().startedAt().plus(MAX_EFFECT).plus(RESUME_MARGIN)));
         ReliableActions actions = actions(journal);
+        ScheduledExecutorService reconciling = Executors.newSingleThreadScheduledExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "reconciler");
+            thread.setDaemon(true);
+            return thread;
+        });
+        reconciling.scheduleWithFixedDelay(() -> {
+            try {
+                actions.reconciler().runOnce();
+            } catch (RuntimeException e) {
+                System.err.println("reconciler run failed: " + e);
+            }
+        }, 0, 100, TimeUnit.MILLISECONDS);
+        callAgain(actions);
+    }
+
+    /** The scripted-model rules of §9.1 from a new tool-call id on. */
+    private void callAgain(ReliableActions actions) {
         actions.leaseRenewer().start();
         ActionOutcome outcome = null;
         int calls = 0;

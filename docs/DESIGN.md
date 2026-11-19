@@ -478,7 +478,7 @@ otherwise the guarantee is reduced to "per failover epoch".
 | **Kill matrix (Q1, R9)** | parent JVM hosts PostgreSQL and `FakeDownstream`; the child is started as `java …` directly (no shell/Gradle wrapper; the test asserts the PID is the JVM). Fault points: `AFTER_CLAIM`; `EFFECT_APPLIED_RESPONSE_HELD` — the fake applies the effect, **notifies the parent**, holds the HTTP response; `AFTER_RESPONSE_BEFORE_RECORD`; `AFTER_RECORD_BEFORE_MEMORY`. Parent SIGKILLs the child when the fault point is confirmed, starts a new child that resumes in mode (a) re-call with a new tool-call id, or (b) memory repair, after which the scripted model follows the result text (re-calls if told it is safe). Reconciler runs. Assertions: effect count per key, final state, model-visible text — against an **expected-outcome table** per (policy × point × mode) | R2, R3, R7, R9 |
 | Negative controls | same matrix with the library bypassed and with `FakeDownstream` dedup off: the test **must fail** (expects ≥ 2 effects or a false "not executed") — proves the harness can see duplicates | test validity |
 | Pause test (Q1p) | `kill -STOP` the child during the held effect past the lease; second child retries; `kill -CONT`; assert stale writes fenced and effect counts per policy; `RECONCILABLE` duplicate asserted as the documented non-guarantee | R1 limits |
-| Randomized (nightly) | kill at a random delay inside the effect window; 500 runs per policy | windows the fixed points miss |
+| Randomized (nightly) | kill at a random delay inside the effect window; 500 runs per policy (`RandomizedKillTest`, `nightly.yml`); the end must be one the §9.1 table allows for the policy, or "killed before the claim committed" | windows the fixed points miss |
 | Ambiguous commit / DB faults | Toxiproxy between client and PostgreSQL: response or request lost at COMMIT for claim and record; blackhole, database down, paused container (fail closed, Q6); pool exhaustion; every journal operation bounded while blackholed; a row lock held by a frozen process | R10, §8 rows, ADR-0006 |
 | LangChain4j contract | scripted fake `ChatModel`; specs and `ReturnBehavior` preserved; `IMMEDIATE` rejected; concurrent tool execution with same-key calls; replay text; memory repair yields a history where every tool call has a result, including the superseded-call-id case | R6, R7 |
 | OTel | `InMemorySpanExporter` / `InMemoryMetricReader`: one span per action with key hash, policy, attempt, outcome | R8 |
@@ -525,9 +525,26 @@ applied. **Negative controls** (must fail, proving the harness sees duplicates):
 `EXECUTING` with different args → `Conflict` (row 4); lookup `Unreachable` past the deadline → `ESCALATED`;
 `IDEMPOTENT_DOWNSTREAM` + unreachable lookup → retry proceeds (row 8 → row 12).
 
-CI: every PR — unit, SQL interleavings, deterministic kill matrix (4 policies × 4 points × 2 modes = 32 runs) plus
-negative controls; nightly — randomized 500 per policy, pause test, Toxiproxy faults, Java 17/21/25, LangChain4j
-floor and latest.
+CI (`ci.yml`, every push and PR): unit, SQL interleavings, deterministic kill matrix (4 policies × 4 points, both
+modes through the example) plus negative controls, the pause test, the two-JVM Q2 and the database fault tests, on Java
+17/21/25 × PostgreSQL 18, PostgreSQL 14 on Java 25, LangChain4j floor (1.14.0, Java 17 job) and latest. Nightly
+(`nightly.yml`, 02:17 UTC and on demand): the same matrix through `workflow_call`, so drift shows up without a push,
+and the randomized kill, 500 runs per policy in four parallel jobs.
+
+**Randomized kill.** The child warms up (a call of another action, one lookup request), prints `RAA-CALLING`, and
+makes the call; the parent kills it after a delay drawn uniformly from 0 to 1.5 times the median duration of three
+unkilled calls of that policy, measured before the runs (about 115–150 ms locally), so kills also land before the claim
+and after the record. The resumed child calls again by the scripted-model rules while the reconciler runs every 100 ms.
+Allowed ends (effects / final state / outcome), split on whether the first call's claim committed (read after the
+resume, so a COMMIT in flight at the kill has landed): without it only 1 / `SUCCEEDED` / `Succeeded` (nothing had
+happened yet); with it the §9.1 cells of the policy over all four fault points — so an `AT_MOST_ONCE` that retries a
+committed claim fails even when the retry applies only one effect. In every run also: no effect under another key,
+never "not performed" after an applied effect, and a returned text is a response of the downstream to one of the
+applied effects of this key. A coverage check per policy (from 20 runs) requires a fifth of the runs to have been
+killed after the claim committed. Each run's name gives the base seed and the window in whole milliseconds;
+`-PrandomizedKillSeed` and `-PrandomizedKillMaxDelayMillis` repeat it exactly. `SplittableRandom`, because
+`java.util.Random` gives nearly equal first values for nearby seeds. The workflow fails when the report has fewer
+tests than requested or any skipped (a skipped test is not a pass).
 
 ## 10. Observability
 
@@ -640,6 +657,12 @@ server wrapper, strict mode, optional local-transaction mode (journal row and a 
   adapter's `execute_tool` observations for journaled and read-only tools and the `toolSpans(false)` switch
   (`ToolSpansTest`). Mutations: a span not made current fails the parent/current assertions; a guard that lets
   exceptions through fails the throwing-telemetry test.
+* Verified since 2026-11-19 (week 6, stage D), locally: the randomized kill, 25 runs per policy (seeds 7 and 11, 100/100
+  each, coverage checks green), hit every allowed end of every policy (both `AT_MOST_ONCE` escalations, the
+  `RECONCILABLE` lookup, the `AT_LEAST_ONCE` duplicate, kills before the claim). A mutation that lets `AT_MOST_ONCE`
+  retry an unknown attempt fails 5 of 25 runs (seed 11): 3 duplicates and 2 single effects after a committed claim, which
+  the first, looser oracle accepted. The
+  500-per-policy nightly runs only on CI (not yet run when this was written).
 * Not yet verified: Q3–Q5 and Q7 beyond the reference timing in the runner test; the `raa.actions.unresolved` gauge
   (week 7).
 * Desk research (not re-verified by the author): framework signatures and memory ordering
@@ -827,7 +850,16 @@ wrapping a read-only tool kept only the synchronous path, so `ObservedToolExecut
 from `EXECUTING` (only row 6 writes there), because row 6 followed by row 7 is a conflict that still moves the row to
 `UNKNOWN`; spans end in `finally` and the guard ends an observation at most once and also catches linkage errors (a
 telemetry library missing from the class path); exceptions record their type only; `journal_error` only for
-`JournalException`. Pool wait and new physical connections cannot be bounded through `DataSource`; the
+`JournalException`.
+
+Revision 16 (2026-11-19, roadmap week 6 stage D): the nightly pipeline and the randomized kill as §9.1 describes them.
+The kill window is calibrated per policy instead of a fixed delay: a first version with 0–400 ms killed every run of a
+cold child before its claim; the child now warms up before announcing the call. `ci.yml` gains `workflow_call` so the
+nightly workflow reuses the matrix. Not linted with actionlint (not installed); checked by GitHub on the first run.
+Independent review (Claude, approve with comments; Codex at its usage limit), fixed the same day: the oracle split on
+whether the first claim committed (the "killed before the claim" end had hidden an at-most-once retry of a committed
+claim), a coverage check per policy, a median of three calibration calls, a seed and window in each run's name that
+repeat it exactly, and the workflow check also requires no skipped test. Pool wait and new physical connections cannot be bounded through `DataSource`; the
 README gives settings that keep Q6 (HikariCP `connectionTimeout` 1 s, `validationTimeout` 0.5 s; pgjdbc `connectTimeout`
 1 s, `loginTimeout` 2 s). Test-only dependencies: `testcontainers-toxiproxy` 2.0.5 (image `ghcr.io/shopify/toxiproxy`
 2.13.0) and HikariCP 7.1.0. A lost request is a Toxiproxy `timeout` toxic, which drops the data and keeps the connection open; the

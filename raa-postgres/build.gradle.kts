@@ -19,6 +19,14 @@ dependencies {
 
 // PostgreSQL image for the tests; CI runs the floor (14) and the latest release (docs/DESIGN.md §7).
 val postgresImage = providers.gradleProperty("postgresImage").orElse("postgres:18-alpine")
+// The randomized kill (RandomizedKillTest, nightly) runs only when randomizedKillRuns is set.
+val randomizedKill = mapOf(
+    "raa.randomizedKill.runs" to providers.gradleProperty("randomizedKillRuns"),
+    "raa.randomizedKill.policies" to providers.gradleProperty("randomizedKillPolicies"),
+    "raa.randomizedKill.seed" to providers.gradleProperty("randomizedKillSeed"),
+    "raa.randomizedKill.maxDelayMillis" to providers.gradleProperty("randomizedKillMaxDelayMillis"),
+)
 tasks.withType<Test>().configureEach {
     systemProperty("raa.postgres.image", postgresImage.get())
+    randomizedKill.forEach { (name, value) -> value.orNull?.let { systemProperty(name, it) } }
 }

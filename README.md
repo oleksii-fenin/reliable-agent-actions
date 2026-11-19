@@ -67,6 +67,9 @@ tool call**, one that **pauses** it past its lease, and negative controls provin
   in PostgreSQL, is killed at the same four points and resumed either by retrying the conversation (mode (a)) or by
   repairing the memory from the journal and continuing (mode (b)); all 32 cells match the table, and in mode (b) the
   repaired answer itself is checked. Without the library the same agent refunds twice.
+* **Verified — killed at a random moment** (nightly, 500 runs per policy; locally 25 per policy): the child is killed
+  anywhere from just before the call to just after it, and every run ends as the expected-outcome table allows for its
+  policy ([`RandomizedKillTest`](raa-postgres/src/test/java/io/github/oleksiifenin/raa/postgres/RandomizedKillTest.java)).
 * **Verified — pause past the lease.** A child JVM is paused with SIGSTOP inside the effect (before its request is sent,
   or after the effect, before the record), its lease expires, a second JVM calls again, then the first is resumed
   ([`PauseTest`](raa-postgres/src/test/java/io/github/oleksiifenin/raa/postgres/PauseTest.java), DESIGN §2 Q1p). The
