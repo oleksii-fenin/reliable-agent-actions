@@ -19,6 +19,8 @@ permissions:
 jobs:
   build:
     uses: ./.github/workflows/ci.yml
+    with:
+      rerun-tests: true
 
   randomized-kill:
     name: randomized kill (${{ matrix.policy }})

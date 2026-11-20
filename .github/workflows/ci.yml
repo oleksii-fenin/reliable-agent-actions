@@ -6,6 +6,13 @@ on:
   pull_request:
   # The nightly workflow runs the same matrix (nightly.yml).
   workflow_call:
+    inputs:
+      rerun-tests:
+        # A push may take test results from the build cache (same inputs, same result); the nightly run must not, or
+        # it re-checks nothing when no commit came in.
+        description: Run every task again instead of taking results from the build cache
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -45,5 +52,6 @@ jobs:
           -PtestJavaVersion=${{ matrix.test-java }}
           -PpostgresImage=${{ matrix.postgres }}
           ${{ matrix.langchain4j && format('-Plangchain4jVersion={0}', matrix.langchain4j) || '' }}
+          ${{ inputs.rerun-tests && '--rerun-tasks' || '' }}
           -Porg.gradle.java.installations.fromEnv=JAVA_HOME_${{ matrix.test-java }}_X64,JAVA_HOME_25_X64
           -Porg.gradle.java.installations.auto-download=false

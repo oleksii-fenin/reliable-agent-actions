@@ -528,7 +528,9 @@ applied. **Negative controls** (must fail, proving the harness sees duplicates):
 CI (`ci.yml`, every push and PR): unit, SQL interleavings, deterministic kill matrix (4 policies × 4 points, both
 modes through the example) plus negative controls, the pause test, the two-JVM Q2 and the database fault tests, on Java
 17/21/25 × PostgreSQL 18, PostgreSQL 14 on Java 25, LangChain4j floor (1.14.0, Java 17 job) and latest. Nightly
-(`nightly.yml`, 02:17 UTC and on demand): the same matrix through `workflow_call`, so drift shows up without a push,
+(`nightly.yml`, 02:17 UTC and on demand): the same matrix through `workflow_call` with `--rerun-tasks` (a push may take
+test results from the Gradle build cache; the first nightly run did so in one job and re-checked nothing there), so
+drift shows up without a push,
 and the randomized kill, 500 runs per policy in four parallel jobs.
 
 **Randomized kill.** The child warms up (a call of another action, one lookup request), prints `RAA-CALLING`, and
