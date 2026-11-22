@@ -74,4 +74,16 @@ public interface ActionTelemetry {
      */
     default void reconcilerResolution(ReconcilerResult result, String toolName) {
     }
+
+    /**
+     * Reports how many actions of the whole journal wait for a lookup or an operator, counted at the end of a
+     * {@link Reconciler#runOnce()} (docs/DESIGN.md §10). Every process that runs the reconciler reports the same
+     * journal-wide numbers, so they are combined with the maximum or the last value, never summed. Not reported when
+     * the count fails; the next run counts again.
+     *
+     * @param unknown   rows in {@code UNKNOWN}
+     * @param escalated rows in {@code ESCALATED}
+     */
+    default void unresolvedActions(long unknown, long escalated) {
+    }
 }

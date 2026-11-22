@@ -7,6 +7,7 @@ import io.github.oleksiifenin.raa.storage.ActionState;
 import io.github.oleksiifenin.raa.storage.ClaimVerdict;
 import io.github.oleksiifenin.raa.storage.RecordOutcome;
 import io.github.oleksiifenin.raa.testkit.InMemoryActionJournal;
+import java.io.IOException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -189,6 +190,31 @@ class ActionTelemetryTest {
     }
 
     @Test
+    void reconcilerRun_reportsTheUnresolvedActions_andItsCountsAreJournalOperations() {
+        ReliableActions actions = actions(ActionPolicy.atLeastOnce(), telemetry);
+        actions.runner().run(call("c1"), context -> {
+            throw new IOException("connection reset"); // indeterminate: UNKNOWN
+        });
+        telemetry.events.clear();
+
+        actions.reconciler().runOnce();
+
+        assertThat(telemetry.events).contains("journal count ok", "unresolved 1 0");
+    }
+
+    @Test
+    void telemetryThatThrowsFromTheGauge_neverBreaksTheReconcilerRun() {
+        ReliableActions actions = actions(ActionPolicy.atMostOnce(), new Throwing());
+        actions.runner().run(call("c1"), context -> {
+            throw new IOException("connection reset");
+        });
+
+        actions.reconciler().runOnce(); // would throw if the guard let the gauge's exception through
+
+        assertThat(journal.countCalls).hasValue(2);
+    }
+
+    @Test
     void errorThrownThroughTheRunner_isReportedAsFailed_andRethrown() {
         ReliableActions actions = actions(ActionPolicy.atMostOnce(), telemetry);
 
@@ -239,7 +265,7 @@ class ActionTelemetryTest {
 
         List<String> actionEvents() {
             return events.stream().filter(event -> !event.startsWith("journal ") && !event.startsWith("signal ")
-                    && !event.startsWith("resolution ")).toList();
+                    && !event.startsWith("resolution ") && !event.startsWith("unresolved ")).toList();
         }
 
         List<String> journalEvents() {
@@ -293,6 +319,11 @@ class ActionTelemetryTest {
         public void reconcilerResolution(ReconcilerResult result, String toolName) {
             events.add("resolution " + result + " " + toolName);
         }
+
+        @Override
+        public void unresolvedActions(long unknown, long escalated) {
+            events.add("unresolved " + unknown + " " + escalated);
+        }
     }
 
     /** Fails in every hook. */
@@ -326,6 +357,11 @@ class ActionTelemetryTest {
         @Override
         public void signal(ActionSignal signal, String toolName) {
             throw new IllegalStateException("signal");
+        }
+
+        @Override
+        public void unresolvedActions(long unknown, long escalated) {
+            throw new IllegalStateException("unresolvedActions");
         }
     }
 }

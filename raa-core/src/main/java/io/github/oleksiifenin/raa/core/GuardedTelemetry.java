@@ -65,6 +65,11 @@ final class GuardedTelemetry implements ActionTelemetry {
         run("reconcilerResolution", () -> delegate.reconcilerResolution(result, toolName));
     }
 
+    @Override
+    public void unresolvedActions(long unknown, long escalated) {
+        run("unresolvedActions", () -> delegate.unresolvedActions(unknown, escalated));
+    }
+
     private static void run(String hook, Runnable call) {
         try {
             call.run();

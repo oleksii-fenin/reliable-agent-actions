@@ -15,6 +15,7 @@ import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.api.metrics.DoubleHistogram;
 import io.opentelemetry.api.metrics.LongCounter;
+import io.opentelemetry.api.metrics.LongGauge;
 import io.opentelemetry.api.metrics.Meter;
 import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.SpanBuilder;
@@ -52,7 +53,11 @@ import java.util.Set;
  * {@code raa.outcome}, {@code exception} for a call that threw); {@code raa.journal.duration} (histogram, seconds: {@code raa.journal.operation},
  * {@code error.type = journal_error} on failure); {@code raa.reconciler.resolutions} (counter: {@code raa.result},
  * {@code gen_ai.tool.name}); {@code raa.stale_success}, {@code raa.late_result_corrected}, {@code raa.lease.expired}
- * (counters: {@code gen_ai.tool.name}). The gauge of unresolved actions comes with the operator API (roadmap week 7).
+ * (counters: {@code gen_ai.tool.name}); {@code raa.actions.unresolved} (gauge, set at the end of every reconciler run:
+ * {@code raa.state = UNKNOWN} or {@code ESCALATED}). The gauge is the count of the whole journal, so every process that
+ * runs the reconciler reports the same value: aggregate it across processes with the maximum, never the sum. While the
+ * journal cannot be counted the gauge keeps its last value; alert on it together with {@code raa.journal.duration}
+ * errors.
  */
 public final class OpenTelemetryActionTelemetry implements ActionTelemetry {
 
@@ -90,6 +95,7 @@ public final class OpenTelemetryActionTelemetry implements ActionTelemetry {
     private final LongCounter staleSuccess;
     private final LongCounter lateResultCorrected;
     private final LongCounter leaseExpired;
+    private final LongGauge unresolved;
 
     private OpenTelemetryActionTelemetry(OpenTelemetry openTelemetry) {
         this.tracer = openTelemetry.getTracer(INSTRUMENTATION_SCOPE);
@@ -107,6 +113,9 @@ public final class OpenTelemetryActionTelemetry implements ActionTelemetry {
                 .setDescription("Late successes that landed after a lookup had said not performed").build();
         this.leaseExpired = meter.counterBuilder("raa.lease.expired").setUnit("{attempt}")
                 .setDescription("Attempts whose lease ran out while executing").build();
+        this.unresolved = meter.gaugeBuilder("raa.actions.unresolved").ofLongs().setUnit("{action}")
+                .setDescription("Actions of the journal waiting for an outcome lookup or an operator, by state")
+                .build();
     }
 
     /**
@@ -181,6 +190,12 @@ public final class OpenTelemetryActionTelemetry implements ActionTelemetry {
     @Override
     public void reconcilerResolution(ReconcilerResult result, String toolName) {
         resolutions.add(1, Attributes.of(RESULT, lowerCase(result.name()), TOOL_NAME, toolName));
+    }
+
+    @Override
+    public void unresolvedActions(long unknown, long escalated) {
+        unresolved.set(unknown, Attributes.of(STATE, ActionState.UNKNOWN.name()));
+        unresolved.set(escalated, Attributes.of(STATE, ActionState.ESCALATED.name()));
     }
 
     /** {@code JournalUnavailable} → {@code journal_unavailable}. */

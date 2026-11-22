@@ -2,6 +2,7 @@ package io.github.oleksiifenin.raa.core;
 
 import io.github.oleksiifenin.raa.storage.ActionJournal;
 import io.github.oleksiifenin.raa.storage.ActionRecord;
+import io.github.oleksiifenin.raa.storage.ActionState;
 import io.github.oleksiifenin.raa.storage.JournalException;
 import io.github.oleksiifenin.raa.storage.KeyAttempt;
 import io.github.oleksiifenin.raa.storage.Resolution;
@@ -22,7 +23,9 @@ import java.util.Objects;
  * {@code resolve_after = clock_timestamp() + hold}, so {@code resolve_after - hold} is the database time of the take.
  *
  * <p>Each run also applies retention: it deletes one batch of {@code SUCCEEDED}/{@code ABANDONED} rows older than
- * {@link ReliableActions.Builder#retention(Duration)} ({@link ActionJournal#deleteTerminalOlderThan}).
+ * {@link ReliableActions.Builder#retention(Duration)} ({@link ActionJournal#deleteTerminalOlderThan}), and, when a
+ * telemetry is configured, counts the {@code UNKNOWN} and {@code ESCALATED} rows for
+ * {@link ActionTelemetry#unresolvedActions}.
  *
  * <p>A lookup needs the action key, which the journal has only as text when {@link
  * ReliableActions.Builder#storeKeyText(boolean)} is on (ADR-0004). Rows without usable key text are left to the next
@@ -59,9 +62,10 @@ public final class Reconciler {
     }
 
     /**
-     * Takes one batch and handles every row in it, then deletes one batch of finished rows past the retention. A
-     * journal failure on one row is logged and the next row is handled; the failed row is taken again after the hold.
-     * A failure of the retention delete is logged; the next run deletes again.
+     * Takes one batch and handles every row in it, then deletes one batch of finished rows past the retention and
+     * reports the unresolved rows to the telemetry. A journal failure on one row is logged and the next row is
+     * handled; the failed row is taken again after the hold. A failure of the retention delete or of the count is
+     * logged; the next run tries again.
      *
      * @return the number of rows taken
      * @throws JournalException if the batch itself cannot be taken
@@ -85,7 +89,24 @@ public final class Reconciler {
                 LOG.log(System.Logger.Level.WARNING, "could not delete finished actions past the retention", e);
             }
         }
+        if (!Thread.currentThread().isInterrupted()) {
+            reportUnresolved();
+        }
         return batch.size();
+    }
+
+    /** Counts unresolved rows for the gauge (docs/DESIGN.md §10); without telemetry nothing is counted. */
+    private void reportUnresolved() {
+        if (telemetry == ActionTelemetry.none()) {
+            return;
+        }
+        try {
+            long unknown = journal.count(ActionState.UNKNOWN);
+            long escalated = journal.count(ActionState.ESCALATED);
+            telemetry.unresolvedActions(unknown, escalated);
+        } catch (JournalException e) {
+            LOG.log(System.Logger.Level.WARNING, "could not count unresolved actions", e);
+        }
     }
 
     private void reconcile(ActionRecord row) {

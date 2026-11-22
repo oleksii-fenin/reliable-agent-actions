@@ -2,6 +2,7 @@ package io.github.oleksiifenin.raa.core;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.github.oleksiifenin.raa.storage.ActionJournal;
 import io.github.oleksiifenin.raa.storage.ActionRecord;
 import io.github.oleksiifenin.raa.storage.ActionState;
 import io.github.oleksiifenin.raa.storage.FailureBasis;
@@ -323,7 +324,71 @@ class ReconcilerTest {
         assertThat(faulty.deleteCalls).hasValue(1);
     }
 
+    // ---- unresolved gauge (docs/DESIGN.md §10)
+
+    @Test
+    void eachRun_reportsTheUnresolvedRowsAfterHandlingItsBatch() {
+        List<String> reports = new ArrayList<>();
+        ReliableActions actions = withTelemetry(journal, reporting(reports));
+        fail(actions, "c1", "order-1");
+        clock.advance(DEADLINE.plusMillis(1)); // order-1 is escalated by the next run, at its deadline
+        fail(actions, "c2", "order-2");
+        fail(actions, "c3", "order-3");
+
+        actions.reconciler().runOnce();
+
+        assertThat(reports).containsExactly("unknown 2 escalated 1");
+    }
+
+    @Test
+    void withoutTelemetry_nothingIsCounted() {
+        FaultyJournal faulty = new FaultyJournal(journal);
+        ReliableActions actions = ReliableActions.builder(faulty)
+                .tool("refund", ActionPolicy.atLeastOnce().key(BY_ORDER).maxEffectDuration(MAX_EFFECT))
+                .lease(LEASE).build();
+        fail(actions);
+
+        actions.reconciler().runOnce();
+
+        assertThat(faulty.countCalls).hasValue(0);
+    }
+
+    @Test
+    void aFailingCount_isLogged_notReported_andTheNextRunReportsAgain() {
+        FaultyJournal faulty = new FaultyJournal(journal);
+        List<String> reports = new ArrayList<>();
+        ReliableActions actions = withTelemetry(faulty, reporting(reports));
+        fail(actions);
+        faulty.failCounts.set(true);
+
+        int taken = actions.reconciler().runOnce();
+        List<String> reportsWhileFailing = List.copyOf(reports);
+        faulty.failCounts.set(false);
+        actions.reconciler().runOnce();
+
+        assertThat(taken).isEqualTo(1);
+        assertThat(reportsWhileFailing).isEmpty();
+        assertThat(reports).containsExactly("unknown 1 escalated 0");
+    }
+
     // ---- helpers
+
+    private static ReliableActions withTelemetry(ActionJournal storage,
+            ActionTelemetry telemetry) {
+        return ReliableActions.builder(storage)
+                .tool("refund", ActionPolicy.atLeastOnce().key(BY_ORDER).maxEffectDuration(MAX_EFFECT)
+                        .deadline(DEADLINE))
+                .lease(LEASE).telemetry(telemetry).build();
+    }
+
+    private static ActionTelemetry reporting(List<String> reports) {
+        return new ActionTelemetry() {
+            @Override
+            public void unresolvedActions(long unknown, long escalated) {
+                reports.add("unknown " + unknown + " escalated " + escalated);
+            }
+        };
+    }
 
     private ReliableActions actions(JournaledPolicy<?> policy, boolean storeKeyText) {
         JournaledPolicy<?> complete = policy.key(BY_ORDER).maxEffectDuration(MAX_EFFECT);

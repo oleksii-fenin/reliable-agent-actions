@@ -22,12 +22,14 @@ import io.opentelemetry.sdk.metrics.SdkMeterProvider;
 import io.opentelemetry.sdk.metrics.data.HistogramPointData;
 import io.opentelemetry.sdk.metrics.data.LongPointData;
 import io.opentelemetry.sdk.metrics.data.MetricData;
+import io.opentelemetry.sdk.metrics.data.MetricDataType;
 import io.opentelemetry.sdk.testing.exporter.InMemoryMetricReader;
 import io.opentelemetry.sdk.testing.exporter.InMemorySpanExporter;
 import io.opentelemetry.sdk.trace.SdkTracerProvider;
 import io.opentelemetry.sdk.trace.data.EventData;
 import io.opentelemetry.sdk.trace.data.SpanData;
 import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor;
+import java.io.IOException;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -168,6 +170,31 @@ class OpenTelemetryActionTelemetryTest {
     }
 
     @Test
+    void reconcilerRun_setsTheUnresolvedGauge_byState() {
+        ReliableActions actions = actions(ActionPolicy.atLeastOnce());
+        actions.runner().run(call("c1"), context -> {
+            throw new IOException("connection reset"); // indeterminate: UNKNOWN
+        });
+
+        actions.reconciler().runOnce();
+
+        MetricData gauge = metric("raa.actions.unresolved");
+        assertThat(gauge.getType()).isEqualTo(MetricDataType.LONG_GAUGE);
+        assertThat(gauge.getUnit()).isEqualTo("{action}");
+        assertThat(gaugeValues()).containsExactlyInAnyOrderEntriesOf(Map.of("UNKNOWN", 1L, "ESCALATED", 0L));
+    }
+
+    @Test
+    void unresolvedGauge_showsTheLastCount_notASum() {
+        OpenTelemetryActionTelemetry telemetry = OpenTelemetryActionTelemetry.create(sdk);
+
+        telemetry.unresolvedActions(3, 1);
+        telemetry.unresolvedActions(2, 0);
+
+        assertThat(gaugeValues()).containsExactlyInAnyOrderEntriesOf(Map.of("UNKNOWN", 2L, "ESCALATED", 0L));
+    }
+
+    @Test
     void staleSuccess_isCounted() {
         ReliableActions actions = actions(ActionPolicy.atLeastOnce());
 
@@ -265,6 +292,12 @@ class OpenTelemetryActionTelemetryTest {
     private MetricData metric(String name) {
         return metrics.collectAllMetrics().stream().filter(metric -> metric.getName().equals(name)).findFirst()
                 .orElseThrow(() -> new AssertionError("no metric " + name));
+    }
+
+    private Map<String, Long> gaugeValues() {
+        return metric("raa.actions.unresolved").getLongGaugeData().getPoints().stream().collect(Collectors.toMap(
+                point -> attribute(point.getAttributes(), AttributeKey.stringKey("raa.state")),
+                LongPointData::getValue));
     }
 
     private Collection<LongPointData> points(String name) {

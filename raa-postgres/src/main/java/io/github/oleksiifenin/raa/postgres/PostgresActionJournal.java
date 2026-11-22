@@ -571,11 +571,9 @@ public final class PostgresActionJournal implements ActionJournal {
         if (limit < 1) {
             throw new IllegalArgumentException("limit must be at least 1: " + limit);
         }
-        String sql = "select " + columns("") + " from raa_action where state = ? order by updated_at, key_hash limit ?";
         return inTransaction("find", tx -> {
-            try (PreparedStatement statement = tx.prepare(sql)) {
-                statement.setString(1, state.name());
-                statement.setInt(2, limit);
+            try (PreparedStatement statement = tx.prepare(findSql(state))) {
+                statement.setInt(1, limit);
                 List<ActionRecord> rows = new ArrayList<>();
                 try (ResultSet resultSet = statement.executeQuery()) {
                     while (resultSet.next()) {
@@ -591,14 +589,28 @@ public final class PostgresActionJournal implements ActionJournal {
     public long count(ActionState state) {
         Objects.requireNonNull(state, "state");
         return inTransaction("count", tx -> {
-            try (PreparedStatement statement = tx.prepare("select count(*) from raa_action where state = ?")) {
-                statement.setString(1, state.name());
+            try (PreparedStatement statement = tx.prepare(countSql(state))) {
                 try (ResultSet resultSet = statement.executeQuery()) {
                     resultSet.next();
                     return resultSet.getLong(1);
                 }
             }
         });
+    }
+
+    /**
+     * The state is a literal, not a parameter: every index on the state is partial, and a generic plan of
+     * {@code state = ?} cannot prove an index predicate, so it would scan the table on every reconciler run. The
+     * literal is an enum constant's name, never input.
+     */
+    static String findSql(ActionState state) {
+        return "select " + columns("") + " from raa_action where state = '" + state.name()
+                + "' order by updated_at, key_hash limit ?";
+    }
+
+    /** Like {@link #findSql}: the state is a literal so that its partial index is used. */
+    static String countSql(ActionState state) {
+        return "select count(*) from raa_action where state = '" + state.name() + "'";
     }
 
     @Override

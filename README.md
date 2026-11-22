@@ -90,7 +90,10 @@ tool call**, one that **pauses** it past its lease, and negative controls provin
 * **Verified — observability** through the OpenTelemetry SDK with in-memory exporters: one `reliable_action` span
   per call (child of the current span, with policy, key hash, attempt and outcome; state transitions as events), the
   `execute_tool` span of the GenAI conventions around it, and the counters and journal-duration histogram; a telemetry
-  that throws never changes an action. The gauge of unresolved actions comes with the operator API (week 7).
+  that throws never changes an action. The gauge `raa.actions.unresolved` (`UNKNOWN` and `ESCALATED` actions of the
+  whole journal, by `raa.state`) is set at the end of every reconciler run and keeps its last value while the journal
+  cannot be counted, so alert on it together with journal errors; aggregate it across processes with the maximum, not
+  the sum.
 * **Verified — retention, operator API, redaction** on PostgreSQL and the in-memory journal
   ([`ActionJournalTck`](raa-journal-tck/src/main/java/io/github/oleksiifenin/raa/tck/ActionJournalTck.java)): every
   reconciler run deletes finished actions older than the retention (default 7 days), never an unresolved one;

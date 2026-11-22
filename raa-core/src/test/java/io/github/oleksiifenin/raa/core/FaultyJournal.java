@@ -36,6 +36,8 @@ final class FaultyJournal implements ActionJournal {
     final AtomicBoolean failResolves = new AtomicBoolean();
     final AtomicBoolean failDeletes = new AtomicBoolean();
     final AtomicInteger deleteCalls = new AtomicInteger();
+    final AtomicBoolean failCounts = new AtomicBoolean();
+    final AtomicInteger countCalls = new AtomicInteger();
     final AtomicInteger renewCalls = new AtomicInteger();
     /** Record writes that fail without reaching the journal. */
     final AtomicInteger recordFailuresBeforeWrite = new AtomicInteger();
@@ -133,6 +135,10 @@ final class FaultyJournal implements ActionJournal {
 
     @Override
     public long count(ActionState state) {
+        countCalls.incrementAndGet();
+        if (failCounts.get()) {
+            throw storageDown();
+        }
         return delegate.count(state);
     }
 

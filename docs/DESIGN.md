@@ -193,6 +193,7 @@ public interface ActionTelemetry {               // §10; every method has a no-
     void journalOperation(String operation, long durationNanos, boolean failed);
     void signal(ActionSignal signal, String toolName);    // STALE_SUCCESS | LATE_RESULT_CORRECTED | LEASE_EXPIRED
     void reconcilerResolution(ReconcilerResult result, String toolName);
+    void unresolvedActions(long unknown, long escalated);  // end of every reconciler run; journal-wide, not per process
 }
 // ActionObservation: claimed(verdict, state, attempt), recorded(outcome, attempt), lookedUp(result), ended(outcome),
 // failed(error); ToolObservation: ended(boolean error), failed(error). Started and ended on the calling thread.
@@ -384,6 +385,13 @@ not repeat" (author, 2026-11-22); for such a conflict it ends "…; it was not p
    schedule. At the estimated 5 actions/s one run per 15 s deletes far more than arrives (1 000 per 15 s ≈ 66/s). A full
    batch fits the operation timeout: 5 000 finished rows of 2 KB with call history, 8 days old, are deleted in five
    batches in under a second locally (`PostgresRetentionTest`).
+7. Gauge (week 7 stage B): when a telemetry is configured, the run ends with `count(UNKNOWN)` and `count(ESCALATED)`
+   and reports them through `ActionTelemetry.unresolvedActions`; without one nothing is counted. A failing count is
+   logged, nothing is reported, and the next run counts again. `count` and `find` put the state into the SQL as a
+   literal (an enum constant, never input), because every index on the state is partial and a generic plan of
+   `state = ?` cannot use a partial index: pgjdbc switches to server-prepared statements after five executions, and
+   the count would then scan the whole journal in every run (`PostgresAdminQueryPlanTest`, with the parameter form as a
+   control that does scan).
 
 **Lease renewer.** Every `lease/2`: `UPDATE raa_action SET lease_until = clock_timestamp() + :lease
 WHERE (key_hash, created_at, attempt) IN (:inFlight) AND state = 'EXECUTING' AND lease_owner = :owner
@@ -609,9 +617,15 @@ never changes an action.
   `JournalException`; measured by a core decorator of the journal with a monotonic clock that never takes part in a decision),
   `raa.reconciler.resolutions` (counter: `raa.result`, `gen_ai.tool.name`), `raa.stale_success`,
   `raa.late_result_corrected`, `raa.lease.expired` (counters: `gen_ai.tool.name`; a lease expiry is counted when the
-  reconciler moves the row to `UNKNOWN` or a claim applies row 6). `raa.actions.unresolved` (gauge: `UNKNOWN` +
-  `ESCALATED`) needs a count the storage SPI does not have; it comes with `ActionAdmin` in week 7 (author,
-  2026-11-19).
+  reconciler moves the row to `UNKNOWN` or a claim applies row 6). `raa.actions.unresolved` (synchronous `LongGauge`,
+  unit `{action}`, `raa.state = UNKNOWN | ESCALATED`, both points set at the end of every reconciler run, step 7 of
+  §6; week 7 stage B). It is set from the reconciler rather than counted in a callback at export time: no database
+  query runs on the metric exporter's thread and telemetry needs no handle on the journal; the price is that the
+  value is as old as the last successful count. While the journal cannot be counted (database down) the gauge keeps
+  its last value for as long as the outage lasts, so an alert on it belongs next to one on `raa.journal.duration`
+  with `error.type = journal_error`. Argued, not verified: the value is journal-wide, so every process running the
+  reconciler reports the same value and they are aggregated with `max`, never `sum`; a process without a reconciler
+  reports no gauge.
 * Hashes of low-entropy values (an order id) are reversible by enumeration; `redact()` removes result/arguments/key
   text, keyed hashing (HMAC with an installation secret) is a v0.2 candidate.
 
@@ -683,9 +697,9 @@ server wrapper, strict mode, optional local-transaction mode (journal row and a 
   trickle and the blocked write hang (fail at the 60 s test timeout); without any bound the blackholed claim hangs;
   without the server-side timeouts the lock case fails by the socket; without the budget check the slow-pool case
   claims. Q6 is shown for the documented pool settings only (ADR-0006).
-* Verified since 2026-11-19 (week 6, stage C): R8 except the unresolved gauge — the spans, events and metrics of §10
-  through the OpenTelemetry SDK with in-memory exporters (`OpenTelemetryActionTelemetryTest`: parent and current span,
-  attributes, error status, counters, the journal histogram, lease expiry, stale success, `execute_tool` with the action
+* Verified since 2026-11-19 (week 6, stage C): R8 except the unresolved gauge (week 7 stage B, below) — the spans,
+  events and metrics of §10 through the OpenTelemetry SDK with in-memory exporters
+  (`OpenTelemetryActionTelemetryTest`: parent and current span, attributes, error status, counters, the journal histogram, lease expiry, stale success, `execute_tool` with the action
   span inside); the hooks the runtime calls and that a throwing telemetry changes nothing (`ActionTelemetryTest`); the
   adapter's `execute_tool` observations for journaled and read-only tools and the `toolSpans(false)` switch
   (`ToolSpansTest`). Mutations: a span not made current fails the parent/current assertions; a guard that lets
@@ -716,8 +730,19 @@ server wrapper, strict mode, optional local-transaction mode (journal row and a 
   and a mutation letting an escalation store its reason on a redacted row fails it; the other redaction paths are not
   mutation-tested one by one. A backlog of 5 000 finished rows is deleted in batches of 1 000 within the default
   operation timeout (`PostgresRetentionTest`).
-* Not yet verified: Q3–Q5 and Q7 beyond the reference timing in the runner test; the `raa.actions.unresolved` gauge
-  (week 7).
+* Verified since 2026-11-22 (week 7, stage B): the `raa.actions.unresolved` gauge, so R8 in full. `ReconcilerTest`:
+  a run reports the counts after handling its batch (two `UNKNOWN`, one escalated by that run), nothing is counted
+  without a telemetry, and a failing count is not reported and the next run reports. `ActionTelemetryTest`: the counts
+  are journal operations, and a telemetry that throws from the gauge does not break the run.
+  `OpenTelemetryActionTelemetryTest`: a `LONG_GAUGE` with unit `{action}` and both states, the last value rather than
+  a sum (cumulative temporality, the SDK default; delta is not tested). `PostgresAdminQueryPlanTest`: as a generic
+  plan, `count` and `find` of every state use the partial index of that state (named per state, never the primary
+  key), the parameter form uses none (control), and the journal sends exactly the SQL whose plans are checked.
+  Mutations, each failing a test (run locally 2026-11-22): arguments swapped, counting without a telemetry, a count
+  failure not caught, the guard letting the gauge's exception through, the OpenTelemetry states swapped, `count` or
+  `find` with the state as a parameter again. Not tested: a run interrupted before the count skips it, like the
+  retention delete.
+* Not yet verified: Q3–Q5 and Q7 beyond the reference timing in the runner test.
 * Desk research (not re-verified by the author): framework signatures and memory ordering
   (`docs/research/framework-integration-surface.md`), competitor behavior (`docs/research/*.md`).
 * Argued: every guarantee in §1/§2 until the §9 tests exist and pass.
@@ -940,3 +965,15 @@ were already empty, so it is now differential; a test shows that a full retentio
 the conflict on a redacted action says it was not performed again; a record write that finds no row is logged; the
 `Replayed` constructor without the redaction flag is gone; the Javadoc says that hashes stay after `redact` and that
 `redact` names the key.
+
+Revision 18 (2026-11-22, roadmap week 7 stage B): the `raa.actions.unresolved` gauge as the plan of the week decided
+(set by the reconciler, not counted at export): `ActionTelemetry.unresolvedActions(unknown, escalated)` with a no-op
+default, guarded like every hook, called at the end of `Reconciler.runOnce` only when a telemetry is configured (§6
+step 7, §10). Found while implementing: `count` and `find` of stage A bound the state as a parameter, which a generic
+plan cannot match against the partial indexes, so every run would have scanned the journal; the state is now a literal
+(an enum constant) and `PostgresAdminQueryPlanTest` checks the plans of all six states.
+Independent review (Claude, approve with comments), fixed the same day: the plan test accepted any index whose name
+starts with `raa_action_`, the primary key included, so it now names the partial index of each state; the control
+asserted a sequential scan, which a scan of the primary key also avoids, so it now asserts that no partial index is
+used; a test ties the checked SQL to what the journal sends; the staleness of the gauge during an outage is documented
+and the cross-process claims are labelled argued.
