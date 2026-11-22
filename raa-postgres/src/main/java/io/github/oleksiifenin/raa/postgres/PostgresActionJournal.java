@@ -13,6 +13,7 @@ import io.github.oleksiifenin.raa.storage.FailureKind;
 import io.github.oleksiifenin.raa.storage.JournalException;
 import io.github.oleksiifenin.raa.storage.JournalWrite;
 import io.github.oleksiifenin.raa.storage.KeyAttempt;
+import io.github.oleksiifenin.raa.storage.ManualResolution;
 import io.github.oleksiifenin.raa.storage.RecordOutcome;
 import io.github.oleksiifenin.raa.storage.RecordResult;
 import io.github.oleksiifenin.raa.storage.Resolution;
@@ -26,6 +27,7 @@ import java.sql.Statement;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
@@ -57,6 +59,9 @@ import javax.sql.DataSource;
  * {@code validationTimeout}, pgjdbc {@code connectTimeout} and {@code loginTimeout}). A connection obtained after the
  * budget is used up is given back unused and the operation fails. The data source must support
  * {@link Connection#abort}.
+ *
+ * <p>A redacted row ({@link #redact}) keeps {@code redacted_at}; every text a later write would store there (key text,
+ * arguments, result, error) is written as {@code null} by the same statement.
  */
 public final class PostgresActionJournal implements ActionJournal {
 
@@ -66,6 +71,8 @@ public final class PostgresActionJournal implements ActionJournal {
     private static final int CLAIM_ROUNDS = 3;
     private static final String MICROS = " * interval '1 microsecond'";
     private static final String NOW = "(select clock_timestamp() as now) t";
+    /** Text parameter of a write, stored only while the row is not redacted. */
+    private static final String UNLESS_REDACTED = "case when redacted_at is null then ? end";
     private static final System.Logger LOG = System.getLogger(PostgresActionJournal.class.getName());
     /** Runs the abort on the watchdog thread; pgjdbc only closes the socket. */
     private static final Executor DIRECT = Runnable::run;
@@ -216,8 +223,10 @@ public final class PostgresActionJournal implements ActionJournal {
         String sql = "update raa_action set state = 'EXECUTING', attempt = ?, lease_owner = ?,"
                 + " lease_until = t.now + ?" + MICROS + ", started_at = t.now, updated_at = t.now,"
                 + " tool_name = ?, policy = ?, max_effect_duration = ?" + MICROS + ","
-                + " all_args_hash = ?, material_args_hash = ?, arguments_json = cast(? as jsonb),"
-                + " key_text = coalesce(?, key_text), result_text = null, last_error = null, failure_basis = null,"
+                + " all_args_hash = ?, material_args_hash = ?,"
+                + " arguments_json = case when redacted_at is null then cast(? as jsonb) end,"
+                + " key_text = case when redacted_at is null then coalesce(?, key_text) end,"
+                + " result_text = null, last_error = null, failure_basis = null,"
                 + " lookup_failures = 0, resolve_after = null from " + NOW
                 + " where key_hash = ? and attempt = ? returning " + columns("raa_action.");
         try (PreparedStatement statement = tx.prepare(sql)) {
@@ -276,33 +285,34 @@ public final class PostgresActionJournal implements ActionJournal {
     // ---- record writes
 
     @Override
-    public RecordResult recordSuccess(byte[] keyHash, int attempt, String resultText) {
-        Objects.requireNonNull(keyHash, "keyHash");
+    public RecordResult recordSuccess(KeyAttempt attempt, String resultText) {
+        Objects.requireNonNull(attempt, "attempt");
         Objects.requireNonNull(resultText, "resultText");
         return inTransaction("recordSuccess", tx -> {
-            Optional<ActionRecord> current = lockRow(tx, keyHash);
+            Optional<ActionRecord> current = lockRow(tx, attempt.keyHash());
             Optional<RecordResult> notApplicable = classifyRecordTarget(current, attempt);
             if (notApplicable.isPresent()) {
                 return notApplicable.get();
             }
-            String sql = "update raa_action set state = 'SUCCEEDED', result_text = ?, failure_basis = null,"
+            String sql = "update raa_action set state = 'SUCCEEDED', result_text = " + UNLESS_REDACTED
+                    + ", failure_basis = null,"
                     + " lease_owner = null, lease_until = null, resolve_after = null, updated_at = clock_timestamp()"
                     + " where key_hash = ? and attempt = ? and state <> 'SUCCEEDED' returning " + columns("");
             try (PreparedStatement statement = tx.prepare(sql)) {
                 statement.setString(1, resultText);
-                statement.setBytes(2, keyHash);
-                statement.setInt(3, attempt);
+                statement.setBytes(2, attempt.keyHash());
+                statement.setInt(3, attempt.attempt());
                 return applied(requireRow(singleRow(statement), "recordSuccess"), current.get());
             }
         });
     }
 
     @Override
-    public RecordResult recordFailure(byte[] keyHash, int attempt, FailureKind kind, String error) {
-        Objects.requireNonNull(keyHash, "keyHash");
+    public RecordResult recordFailure(KeyAttempt attempt, FailureKind kind, String error) {
+        Objects.requireNonNull(attempt, "attempt");
         Objects.requireNonNull(kind, "kind");
         return inTransaction("recordFailure", tx -> {
-            Optional<ActionRecord> current = lockRow(tx, keyHash);
+            Optional<ActionRecord> current = lockRow(tx, attempt.keyHash());
             Optional<RecordResult> notApplicable = classifyRecordTarget(current, attempt);
             if (notApplicable.isPresent()) {
                 return notApplicable.get();
@@ -312,7 +322,8 @@ public final class PostgresActionJournal implements ActionJournal {
                 return new RecordResult(RecordOutcome.ALREADY_RESOLVED, current, Optional.of(state));
             }
             boolean definite = kind == FailureKind.DEFINITE;
-            String sql = "update raa_action set state = ?, failure_basis = ?, last_error = ?, lease_owner = null,"
+            String sql = "update raa_action set state = ?, failure_basis = ?, last_error = " + UNLESS_REDACTED
+                    + ", lease_owner = null,"
                     + " lease_until = null, resolve_after = t.now, updated_at = t.now from " + NOW
                     + " where key_hash = ? and attempt = ? and state in ('EXECUTING','UNKNOWN')"
                     + " returning " + columns("raa_action.");
@@ -320,20 +331,23 @@ public final class PostgresActionJournal implements ActionJournal {
                 statement.setString(1, definite ? ActionState.FAILED.name() : ActionState.UNKNOWN.name());
                 statement.setString(2, definite ? FailureBasis.DEFINITE.name() : null);
                 statement.setString(3, error);
-                statement.setBytes(4, keyHash);
-                statement.setInt(5, attempt);
+                statement.setBytes(4, attempt.keyHash());
+                statement.setInt(5, attempt.attempt());
                 return applied(requireRow(singleRow(statement), "recordFailure"), current.get());
             }
         });
     }
 
-    /** The outcomes shared by both record writes when the write must not land; empty if it may. */
-    private static Optional<RecordResult> classifyRecordTarget(Optional<ActionRecord> current, int attempt) {
-        if (current.isEmpty()) {
+    /**
+     * The outcomes shared by both record writes when the write must not land; empty if it may. Decided on the locked
+     * row, so the update that follows (by key and attempt) changes exactly the row checked here.
+     */
+    private static Optional<RecordResult> classifyRecordTarget(Optional<ActionRecord> current, KeyAttempt attempt) {
+        if (current.isEmpty() || !attempt.isOf(current.get())) {
             return Optional.of(new RecordResult(RecordOutcome.MISSING, Optional.empty(), Optional.empty()));
         }
         ActionRecord row = current.get();
-        if (row.attempt() != attempt) {
+        if (row.attempt() != attempt.attempt()) {
             return Optional.of(new RecordResult(RecordOutcome.SUPERSEDED, current, Optional.of(row.state())));
         }
         if (row.state() == ActionState.SUCCEEDED) {
@@ -349,18 +363,20 @@ public final class PostgresActionJournal implements ActionJournal {
     // ---- lease and reconciliation
 
     @Override
-    public boolean markUnknownIfLeaseExpired(byte[] keyHash, int attempt, String reason) {
-        Objects.requireNonNull(keyHash, "keyHash");
+    public boolean markUnknownIfLeaseExpired(KeyAttempt attempt, String reason) {
+        Objects.requireNonNull(attempt, "attempt");
         // Lock first, so the time below is read after any lock wait (a FROM-subquery time would be stale).
-        String sql = "update raa_action set state = 'UNKNOWN', last_error = ?, lease_owner = null, lease_until = null,"
+        String sql = "update raa_action set state = 'UNKNOWN', last_error = " + UNLESS_REDACTED
+                + ", lease_owner = null, lease_until = null,"
                 + " resolve_after = t.now, updated_at = t.now from " + NOW
-                + " where key_hash = ? and attempt = ? and state = 'EXECUTING' and lease_until < t.now";
+                + " where key_hash = ? and created_at = ? and attempt = ? and state = 'EXECUTING' and lease_until < t.now";
         return inTransaction("markUnknownIfLeaseExpired", tx -> {
-            lockRow(tx, keyHash);
+            lockRow(tx, attempt.keyHash());
             try (PreparedStatement statement = tx.prepare(sql)) {
                 statement.setString(1, reason);
-                statement.setBytes(2, keyHash);
-                statement.setInt(3, attempt);
+                statement.setBytes(2, attempt.keyHash());
+                statement.setObject(3, timestamp(attempt.createdAt()));
+                statement.setInt(4, attempt.attempt());
                 return statement.executeUpdate() == 1;
             }
         });
@@ -377,37 +393,47 @@ public final class PostgresActionJournal implements ActionJournal {
         // Lock the rows first (in key order, so concurrent renewers cannot deadlock), then update with the time read
         // after the locks: a renewal that waited past started_at + max_effect_duration renews nothing. A predicate
         // evaluated before a lock wait is not re-checked when the lock holder did not change the row.
-        String lock = "select 1 from raa_action a join unnest(?, ?) as f(key_hash, attempt)"
-                + " on a.key_hash = f.key_hash and a.attempt = f.attempt order by a.key_hash for update of a";
+        // Creation times travel as microseconds since the epoch (PostgreSQL's resolution, exact in bigint).
+        String match = " on a.key_hash = f.key_hash and a.attempt = f.attempt"
+                + " and a.created_at = timestamptz 'epoch' + f.created_micros" + MICROS;
+        String lock = "select 1 from raa_action a join unnest(?, ?, ?) as f(key_hash, attempt, created_micros)"
+                + match + " order by a.key_hash for update of a";
         String sql = "update raa_action a set lease_until = t.now + ?" + MICROS + " from " + NOW
-                + ", unnest(?, ?) as f(key_hash, attempt)"
-                + " where a.key_hash = f.key_hash and a.attempt = f.attempt and a.state = 'EXECUTING'"
+                + " join unnest(?, ?, ?) as f(key_hash, attempt, created_micros) on true"
+                + " where a.key_hash = f.key_hash and a.attempt = f.attempt"
+                + " and a.created_at = timestamptz 'epoch' + f.created_micros" + MICROS + " and a.state = 'EXECUTING'"
                 + " and a.lease_owner = ? and t.now < a.started_at + a.max_effect_duration";
         byte[][] keyHashes = new byte[inFlight.size()][];
         Integer[] attempts = new Integer[inFlight.size()];
+        Long[] created = new Long[inFlight.size()];
         int index = 0;
         for (KeyAttempt keyAttempt : inFlight) {
             keyHashes[index] = keyAttempt.keyHash();
             attempts[index] = keyAttempt.attempt();
+            created[index] = epochMicros(keyAttempt.createdAt());
             index++;
         }
         return inTransaction("renewLeases", tx -> {
             Array keyArray = tx.connection().createArrayOf("bytea", keyHashes);
             Array attemptArray = tx.connection().createArrayOf("int4", attempts);
+            Array createdArray = tx.connection().createArrayOf("int8", created);
             try (PreparedStatement statement = tx.prepare(lock)) {
                 statement.setArray(1, keyArray);
                 statement.setArray(2, attemptArray);
+                statement.setArray(3, createdArray);
                 statement.executeQuery().close();
             }
             try (PreparedStatement statement = tx.prepare(sql)) {
                 statement.setLong(1, micros(lease));
                 statement.setArray(2, keyArray);
                 statement.setArray(3, attemptArray);
-                statement.setString(4, owner);
+                statement.setArray(4, createdArray);
+                statement.setString(5, owner);
                 return statement.executeUpdate();
             } finally {
                 keyArray.free();
                 attemptArray.free();
+                createdArray.free();
             }
         });
     }
@@ -442,15 +468,16 @@ public final class PostgresActionJournal implements ActionJournal {
     }
 
     @Override
-    public boolean resolve(byte[] keyHash, int attempt, Resolution resolution) {
-        Objects.requireNonNull(keyHash, "keyHash");
+    public boolean resolve(KeyAttempt attempt, Resolution resolution) {
+        Objects.requireNonNull(attempt, "attempt");
         Objects.requireNonNull(resolution, "resolution");
         String set;
         String sourceState = ActionState.UNKNOWN.name();
         String text = null;
         long backoffMicros = 0;
         if (resolution instanceof Resolution.Applied) {
-            set = "state = 'SUCCEEDED', result_text = ?, failure_basis = null, resolve_after = null";
+            set = "state = 'SUCCEEDED', result_text = " + UNLESS_REDACTED + ", failure_basis = null,"
+                    + " resolve_after = null";
             text = ((Resolution.Applied) resolution).resultText();
         } else if (resolution instanceof Resolution.NotApplied) {
             set = "state = 'FAILED', failure_basis = 'LOOKUP', resolve_after = t.now";
@@ -458,15 +485,15 @@ public final class PostgresActionJournal implements ActionJournal {
             set = "lookup_failures = lookup_failures + 1, resolve_after = t.now + ?" + MICROS;
             backoffMicros = micros(((Resolution.LookupUnreachable) resolution).backoff());
         } else if (resolution instanceof Resolution.Escalate) {
-            set = "state = 'ESCALATED', last_error = ?, resolve_after = null";
+            set = "state = 'ESCALATED', last_error = " + UNLESS_REDACTED + ", resolve_after = null";
             text = ((Resolution.Escalate) resolution).reason();
         } else {
-            set = "state = 'ABANDONED', last_error = ?, resolve_after = null";
+            set = "state = 'ABANDONED', last_error = " + UNLESS_REDACTED + ", resolve_after = null";
             text = ((Resolution.Abandon) resolution).reason();
             sourceState = ActionState.FAILED.name();
         }
         String sql = "update raa_action set " + set + ", updated_at = t.now from " + NOW
-                + " where key_hash = ? and attempt = ? and state = ?";
+                + " where key_hash = ? and created_at = ? and attempt = ? and state = ?";
         String textParameter = text;
         long backoffParameter = backoffMicros;
         String sourceParameter = sourceState;
@@ -479,8 +506,9 @@ public final class PostgresActionJournal implements ActionJournal {
                 if (resolution instanceof Resolution.LookupUnreachable) {
                     statement.setLong(++i, backoffParameter);
                 }
-                statement.setBytes(++i, keyHash);
-                statement.setInt(++i, attempt);
+                statement.setBytes(++i, attempt.keyHash());
+                statement.setObject(++i, timestamp(attempt.createdAt()));
+                statement.setInt(++i, attempt.attempt());
                 statement.setString(++i, sourceParameter);
                 return statement.executeUpdate() == 1;
             }
@@ -506,6 +534,105 @@ public final class PostgresActionJournal implements ActionJournal {
                             resultSet.getInt("call_attempt"), instant(resultSet, "seen_at"),
                             actionRecord(resultSet)));
                 }
+            }
+        });
+    }
+
+    // ---- retention and operator operations
+
+    @Override
+    public int deleteTerminalOlderThan(Duration retention, int batchSize) {
+        Objects.requireNonNull(retention, "retention");
+        if (retention.isNegative() || retention.isZero()) {
+            throw new IllegalArgumentException("retention must be positive: " + retention);
+        }
+        if (batchSize < 1) {
+            throw new IllegalArgumentException("batchSize must be at least 1: " + batchSize);
+        }
+        // SKIP LOCKED: a row a claim or a late write holds is left for the next batch instead of being waited for, so
+        // the time read before the locks is never stale. The call history goes with the row (on delete cascade).
+        String sql = "with t as (select clock_timestamp() as now), doomed as ("
+                + " select key_hash from raa_action, t"
+                + " where state in ('SUCCEEDED','ABANDONED') and updated_at < t.now - ?" + MICROS
+                + " order by updated_at limit ? for update of raa_action skip locked)"
+                + " delete from raa_action a using doomed where a.key_hash = doomed.key_hash";
+        return inTransaction("deleteTerminalOlderThan", tx -> {
+            try (PreparedStatement statement = tx.prepare(sql)) {
+                statement.setLong(1, micros(retention));
+                statement.setInt(2, batchSize);
+                return statement.executeUpdate();
+            }
+        });
+    }
+
+    @Override
+    public List<ActionRecord> find(ActionState state, int limit) {
+        Objects.requireNonNull(state, "state");
+        if (limit < 1) {
+            throw new IllegalArgumentException("limit must be at least 1: " + limit);
+        }
+        String sql = "select " + columns("") + " from raa_action where state = ? order by updated_at, key_hash limit ?";
+        return inTransaction("find", tx -> {
+            try (PreparedStatement statement = tx.prepare(sql)) {
+                statement.setString(1, state.name());
+                statement.setInt(2, limit);
+                List<ActionRecord> rows = new ArrayList<>();
+                try (ResultSet resultSet = statement.executeQuery()) {
+                    while (resultSet.next()) {
+                        rows.add(actionRecord(resultSet));
+                    }
+                }
+                return rows;
+            }
+        });
+    }
+
+    @Override
+    public long count(ActionState state) {
+        Objects.requireNonNull(state, "state");
+        return inTransaction("count", tx -> {
+            try (PreparedStatement statement = tx.prepare("select count(*) from raa_action where state = ?")) {
+                statement.setString(1, state.name());
+                try (ResultSet resultSet = statement.executeQuery()) {
+                    resultSet.next();
+                    return resultSet.getLong(1);
+                }
+            }
+        });
+    }
+
+    @Override
+    public boolean resolveManually(KeyAttempt attempt, ManualResolution resolution) {
+        Objects.requireNonNull(attempt, "attempt");
+        Objects.requireNonNull(resolution, "resolution");
+        boolean applied = resolution instanceof ManualResolution.Applied;
+        String sql = "update raa_action set " + (applied
+                ? "state = 'SUCCEEDED', result_text = " + UNLESS_REDACTED + ", failure_basis = null"
+                : "state = 'ABANDONED', last_error = " + UNLESS_REDACTED)
+                + ", resolve_after = null, updated_at = clock_timestamp()"
+                + " where key_hash = ? and created_at = ? and attempt = ? and state = 'ESCALATED'";
+        String text = applied ? ((ManualResolution.Applied) resolution).resultText()
+                : ManualResolution.NOT_APPLIED_ERROR;
+        return inTransaction("resolveManually", tx -> {
+            try (PreparedStatement statement = tx.prepare(sql)) {
+                statement.setString(1, text);
+                statement.setBytes(2, attempt.keyHash());
+                statement.setObject(3, timestamp(attempt.createdAt()));
+                statement.setInt(4, attempt.attempt());
+                return statement.executeUpdate() == 1;
+            }
+        });
+    }
+
+    @Override
+    public boolean redact(byte[] keyHash) {
+        Objects.requireNonNull(keyHash, "keyHash");
+        String sql = "update raa_action set key_text = null, arguments_json = null, result_text = null,"
+                + " last_error = null, redacted_at = coalesce(redacted_at, clock_timestamp()) where key_hash = ?";
+        return inTransaction("redact", tx -> {
+            try (PreparedStatement statement = tx.prepare(sql)) {
+                statement.setBytes(1, keyHash);
+                return statement.executeUpdate() == 1;
             }
         });
     }
@@ -698,7 +825,7 @@ public final class PostgresActionJournal implements ActionJournal {
                 prefix + "resolve_after", prefix + "lookup_failures", prefix + "failure_basis",
                 prefix + "all_args_hash", prefix + "scope_hash", prefix + "material_args_hash",
                 "cast(" + prefix + "arguments_json as text) as arguments_json", prefix + "result_text",
-                prefix + "last_error");
+                prefix + "last_error", prefix + "redacted_at");
     }
 
     private static Optional<ActionRecord> singleRow(PreparedStatement statement) throws SQLException {
@@ -735,7 +862,8 @@ public final class PostgresActionJournal implements ActionJournal {
                 resultSet.getBytes("material_args_hash"),
                 resultSet.getString("arguments_json"),
                 resultSet.getString("result_text"),
-                resultSet.getString("last_error"));
+                resultSet.getString("last_error"),
+                instant(resultSet, "redacted_at"));
     }
 
     private static Instant instant(ResultSet resultSet, String column) throws SQLException {
@@ -745,6 +873,14 @@ public final class PostgresActionJournal implements ActionJournal {
 
     private static Instant instant(ResultSet resultSet, int column) throws SQLException {
         return resultSet.getObject(column, OffsetDateTime.class).toInstant();
+    }
+
+    private static OffsetDateTime timestamp(Instant instant) {
+        return OffsetDateTime.ofInstant(instant, ZoneOffset.UTC);
+    }
+
+    private static long epochMicros(Instant instant) {
+        return Math.addExact(Math.multiplyExact(instant.getEpochSecond(), 1_000_000L), instant.getNano() / 1000);
     }
 
     /** Microseconds (PostgreSQL's interval resolution), rounded up so a positive duration stays positive. */

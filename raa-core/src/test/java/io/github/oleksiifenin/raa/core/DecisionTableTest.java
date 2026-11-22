@@ -666,7 +666,7 @@ class DecisionTableTest {
             Instant createdAt = NOW.minusSeconds(10);
             return new ActionRecord(filled(9), null, "refund", "TEST", state, attempt, "owner-0", leaseUntil,
                     MAX_EFFECT, createdAt, deadlineAt, startedAt, createdAt, resolveAfter, lookupFailures, failureBasis, ALL_ARGS,
-                    filled(8), MATERIAL, null, null, null);
+                    filled(8), MATERIAL, null, null, null, null);
         }
     }
 }

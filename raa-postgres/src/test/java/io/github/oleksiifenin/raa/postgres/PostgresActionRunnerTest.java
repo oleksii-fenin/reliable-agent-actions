@@ -11,6 +11,7 @@ import io.github.oleksiifenin.raa.core.ToolCall;
 import io.github.oleksiifenin.raa.storage.ActionJournal;
 import io.github.oleksiifenin.raa.storage.ActionRecord;
 import io.github.oleksiifenin.raa.storage.ActionState;
+import io.github.oleksiifenin.raa.storage.KeyAttempt;
 import java.math.BigDecimal;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -85,7 +86,7 @@ class PostgresActionRunnerTest {
                     && databaseNow().isAfter(firstLeaseEnd.plus(lease.dividedBy(2))));
 
             assertThat(row("c1").leaseUntil()).isAfter(firstLeaseEnd.plus(lease.dividedBy(2)));
-            assertThat(JOURNAL.markUnknownIfLeaseExpired(row("c1").keyHash(), 1, "test")).isFalse();
+            assertThat(JOURNAL.markUnknownIfLeaseExpired(KeyAttempt.of(row("c1")), "test")).isFalse();
             assertThat(row("c1").state()).isEqualTo(ActionState.EXECUTING);
             return "refunded";
         });
@@ -102,7 +103,7 @@ class PostgresActionRunnerTest {
             ActionRecord row = row("c1");
             eventually(() -> databaseNow().isAfter(row.startedAt().plus(maxEffect)));
             assertThat(actions.leaseRenewer().renewNow()).isZero();
-            eventually(() -> JOURNAL.markUnknownIfLeaseExpired(row.keyHash(), 1, "lease expired"));
+            eventually(() -> JOURNAL.markUnknownIfLeaseExpired(KeyAttempt.of(row), "lease expired"));
             return "refunded late";
         });
 

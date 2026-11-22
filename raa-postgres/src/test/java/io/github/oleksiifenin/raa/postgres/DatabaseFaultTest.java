@@ -244,13 +244,14 @@ class DatabaseFaultTest {
     void everyJournalOperation_endsWithinItsTimeout_whileTheDatabaseIsBlackholed() throws IOException {
         byte[] keyHash = ActionKey.of(scope, "refund", "order-42").hash();
         byte[] scopeHash = ActionKey.of(scope, "refund").scopeHash();
+        KeyAttempt attempt = new KeyAttempt(keyHash, Instant.EPOCH, 1);
         Map<String, Runnable> operations = Map.of(
-                "recordSuccess", () -> journal.recordSuccess(keyHash, 1, "refunded"),
-                "recordFailure", () -> journal.recordFailure(keyHash, 1, FailureKind.DEFINITE, "rejected"),
-                "markUnknownIfLeaseExpired", () -> journal.markUnknownIfLeaseExpired(keyHash, 1, "expired"),
-                "renewLeases", () -> journal.renewLeases("owner", List.of(new KeyAttempt(keyHash, 1)), LEASE),
+                "recordSuccess", () -> journal.recordSuccess(attempt, "refunded"),
+                "recordFailure", () -> journal.recordFailure(attempt, FailureKind.DEFINITE, "rejected"),
+                "markUnknownIfLeaseExpired", () -> journal.markUnknownIfLeaseExpired(attempt, "expired"),
+                "renewLeases", () -> journal.renewLeases("owner", List.of(attempt), LEASE),
                 "takeReconcileBatch", () -> journal.takeReconcileBatch(LEASE, 10),
-                "resolve", () -> journal.resolve(keyHash, 1, new Resolution.Escalate("operator")),
+                "resolve", () -> journal.resolve(attempt, new Resolution.Escalate("operator")),
                 "findByProviderCallId", () -> journal.findByProviderCallId(scopeHash, "c1"));
 
         for (Map.Entry<String, Runnable> operation : operations.entrySet()) {

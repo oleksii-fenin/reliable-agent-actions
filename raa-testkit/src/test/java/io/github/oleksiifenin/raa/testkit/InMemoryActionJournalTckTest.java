@@ -65,13 +65,13 @@ class InMemoryActionJournalTckTest extends ActionJournalTck {
         assertThat(row.maxEffectDuration()).isEqualTo(Duration.ofNanos(3000));
         assertThat(row.deadlineAt()).isEqualTo(now.plusNanos(4000));
         clock.set(row.leaseUntil());
-        assertThat(storage.markUnknownIfLeaseExpired(request.keyHash(), 1, "expired")).isFalse();
-        assertThat(storage.renewLeases("owner", List.of(new KeyAttempt(request.keyHash(), 1),
-                new KeyAttempt(request.keyHash().clone(), 1)), Duration.ofNanos(1))).isEqualTo(1);
+        assertThat(storage.markUnknownIfLeaseExpired(attempt(storage, request, 1), "expired")).isFalse();
+        assertThat(storage.renewLeases("owner", List.of(KeyAttempt.of(row),
+                new KeyAttempt(request.keyHash().clone(), row.createdAt(), 1)), Duration.ofNanos(1))).isEqualTo(1);
         assertThat(snapshot(storage, request).updatedAt()).isEqualTo(now);
         clock.set(now.plusNanos(3000));
-        assertThat(storage.renewLeases("owner", List.of(new KeyAttempt(request.keyHash(), 1)), LONG_LEASE)).isZero();
-        assertThat(storage.markUnknownIfLeaseExpired(request.keyHash(), 1, "expired")).isTrue();
+        assertThat(storage.renewLeases("owner", List.of(attempt(storage, request, 1)), LONG_LEASE)).isZero();
+        assertThat(storage.markUnknownIfLeaseExpired(attempt(storage, request, 1), "expired")).isTrue();
     }
 
     @Test
@@ -80,9 +80,9 @@ class InMemoryActionJournalTckTest extends ActionJournalTck {
         InMemoryActionJournal storage = new InMemoryActionJournal(clock);
         ClaimRequest first = richRequest(newKey(), newKey(), "original", "call", "{\"a\":1}");
         ActionRecord original = storage.claim(first, start(1)).record();
-        storage.recordFailure(first.keyHash(), 1, FailureKind.DEFINITE, "error");
+        storage.recordFailure(attempt(storage, first, 1), FailureKind.DEFINITE, "error");
         storage.claim(first, fixed(ClaimVerdict.NEEDS_LOOKUP, new JournalWrite.ChangeState(ActionState.UNKNOWN)));
-        storage.resolve(first.keyHash(), 1, new Resolution.LookupUnreachable(Duration.ofSeconds(1)));
+        storage.resolve(attempt(storage, first, 1), new Resolution.LookupUnreachable(Duration.ofSeconds(1)));
         clock.set(clock.instant().plusSeconds(1));
         ClaimRequest next = new ClaimRequest(first.keyHash().clone(), newKey(), null, "new-tool", "new-policy",
                 newKey(), newKey(), "[false]", "call", "new-owner", Duration.ofSeconds(3),
@@ -117,14 +117,14 @@ class InMemoryActionJournalTckTest extends ActionJournalTck {
         InMemoryActionJournal storage = new InMemoryActionJournal(clock);
         ClaimRequest request = richRequest(newKey(), newKey(), null, null, null);
         storage.claim(request, start(1));
-        storage.recordFailure(request.keyHash(), 1, FailureKind.DEFINITE, "keep error");
+        storage.recordFailure(attempt(storage, request, 1), FailureKind.DEFINITE, "keep error");
         storage.claim(request, fixed(ClaimVerdict.NEEDS_LOOKUP, new JournalWrite.ChangeState(ActionState.UNKNOWN)));
-        storage.resolve(request.keyHash(), 1, new Resolution.LookupUnreachable(Duration.ofNanos(1)));
+        storage.resolve(attempt(storage, request, 1), new Resolution.LookupUnreachable(Duration.ofNanos(1)));
         ActionRecord before = snapshot(storage, request);
         assertThat(before.failureBasis()).isEqualTo(FailureBasis.DEFINITE);
         assertThat(before.resolveAfter()).isEqualTo(before.updatedAt().plusNanos(1000));
 
-        storage.resolve(request.keyHash(), 1, new Resolution.Applied("found"));
+        storage.resolve(attempt(storage, request, 1), new Resolution.Applied("found"));
 
         ActionRecord after = snapshot(storage, request);
         assertThat(after.lastError()).isEqualTo("keep error");
@@ -136,10 +136,10 @@ class InMemoryActionJournalTckTest extends ActionJournalTck {
 
         storage.claim(request, fixed(ClaimVerdict.NEEDS_LOOKUP, new JournalWrite.ChangeState(ActionState.UNKNOWN)));
         assertThat(snapshot(storage, request).resultText()).isEqualTo("found");
-        storage.resolve(request.keyHash(), 1, new Resolution.NotApplied());
-        storage.resolve(request.keyHash(), 1, new Resolution.Abandon("deadline"));
+        storage.resolve(attempt(storage, request, 1), new Resolution.NotApplied());
+        storage.resolve(attempt(storage, request, 1), new Resolution.Abandon("deadline"));
         assertThat(snapshot(storage, request).failureBasis()).isEqualTo(FailureBasis.LOOKUP);
-        storage.recordSuccess(request.keyHash(), 1, "late");
+        storage.recordSuccess(attempt(storage, request, 1), "late");
         ActionRecord late = snapshot(storage, request);
         assertThat(late.lastError()).isEqualTo("deadline");
         assertThat(late.lookupFailures()).isEqualTo(1);
@@ -160,7 +160,7 @@ class InMemoryActionJournalTckTest extends ActionJournalTck {
         CallRecord unchanged = storage.findByProviderCallId(first.scopeHash(), "same-call").orElseThrow();
         assertThat(unchanged.action().keyHash()).isEqualTo(first.keyHash());
         assertThat(unchanged.seenAt()).isEqualTo(original.seenAt());
-        storage.recordFailure(first.keyHash(), 1, FailureKind.DEFINITE, "retry");
+        storage.recordFailure(attempt(storage, first, 1), FailureKind.DEFINITE, "retry");
         storage.claim(first, start(2));
         CallRecord retried = storage.findByProviderCallId(first.scopeHash(), "same-call").orElseThrow();
         assertThat(retried.attempt()).isEqualTo(2);
@@ -180,7 +180,7 @@ class InMemoryActionJournalTckTest extends ActionJournalTck {
         ActionRecord lowBefore = storage.claim(second, start(1)).record();
         ClaimRequest unknown = richRequest(newKey(), newKey(), null, null, null);
         storage.claim(unknown, start(1));
-        storage.recordFailure(unknown.keyHash(), 1, FailureKind.INDETERMINATE, "unknown");
+        storage.recordFailure(attempt(storage, unknown, 1), FailureKind.INDETERMINATE, "unknown");
         clock.set(highBefore.leaseUntil().plusNanos(1000));
 
         List<ActionRecord> batch = storage.takeReconcileBatch(Duration.ofNanos(1), 2);
@@ -211,9 +211,9 @@ class InMemoryActionJournalTckTest extends ActionJournalTck {
         try {
             await(deciding);
             CompletableFuture<Integer> renewal = async(() -> storage.renewLeases("owner",
-                    List.of(new KeyAttempt(request.keyHash(), 1)), LONG_LEASE));
-            CompletableFuture<Boolean> marking = async(() -> storage.markUnknownIfLeaseExpired(request.keyHash(),
-                    1, "expired"));
+                    List.of(KeyAttempt.of(before)), LONG_LEASE));
+            CompletableFuture<Boolean> marking = async(() -> storage.markUnknownIfLeaseExpired(KeyAttempt.of(before),
+                    "expired"));
             AtomicReference<Instant> decisionTime = new AtomicReference<>();
             CompletableFuture<ClaimResult> claim = async(() -> storage.claim(request, (call, row, now) -> {
                 decisionTime.set(now);
@@ -279,7 +279,7 @@ class InMemoryActionJournalTckTest extends ActionJournalTck {
         try {
             await(deciding);
             CompletableFuture<Integer> renewal = async(() -> storage.renewLeases("owner",
-                    List.of(new KeyAttempt(request.keyHash(), 1)), LONG_LEASE));
+                    List.of(KeyAttempt.of(before)), LONG_LEASE));
             eventually(() -> storage.transactionsWaitingForLock() == 1);
             clock.set(before.startedAt().plus(request.maxEffectDuration()));
             release.countDown();
@@ -298,7 +298,7 @@ class InMemoryActionJournalTckTest extends ActionJournalTck {
         InMemoryActionJournal storage = new InMemoryActionJournal(clock);
         ClaimRequest request = richRequest(newKey(), newKey(), null, null, null);
         ActionRecord original = storage.claim(request, start(1)).record();
-        storage.recordFailure(request.keyHash(), 1, FailureKind.INDETERMINATE, "unknown");
+        storage.recordFailure(attempt(storage, request, 1), FailureKind.INDETERMINATE, "unknown");
         CountDownLatch deciding = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
         CompletableFuture<ClaimResult> holder = async(() -> storage.claim(request, (call, row, now) -> {
@@ -310,7 +310,7 @@ class InMemoryActionJournalTckTest extends ActionJournalTck {
         Instant afterWait = original.startedAt().plusSeconds(30);
         try {
             await(deciding);
-            CompletableFuture<Boolean> resolution = async(() -> storage.resolve(request.keyHash(), 1,
+            CompletableFuture<Boolean> resolution = async(() -> storage.resolve(KeyAttempt.of(original),
                     new Resolution.LookupUnreachable(backoff)));
             eventually(() -> storage.transactionsWaitingForLock() == 1);
             clock.set(afterWait);
@@ -388,6 +388,11 @@ class InMemoryActionJournalTckTest extends ActionJournalTck {
 
     private static ClaimDecider start(int attempt) {
         return (request, row, now) -> new ClaimDecision(ClaimVerdict.START, new JournalWrite.StartAttempt(attempt));
+    }
+
+    /** Attempt {@code attempt} of the row of {@code request} as it exists now. */
+    private static KeyAttempt attempt(InMemoryActionJournal storage, ClaimRequest request, int attempt) {
+        return new KeyAttempt(request.keyHash(), snapshot(storage, request).createdAt(), attempt);
     }
 
     private static ActionRecord snapshot(InMemoryActionJournal storage, ClaimRequest request) {

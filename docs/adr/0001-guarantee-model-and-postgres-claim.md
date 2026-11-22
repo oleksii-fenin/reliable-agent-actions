@@ -69,7 +69,8 @@ and escalates what cannot be resolved before the deadline.
   not the caller's). The key is stored as a SHA-256 hash of its canonical form.
 * Existing row → decision table (DESIGN §6): terminal → replay; `EXECUTING` with live lease → wait up to 2 s, then `InProgressElsewhere`;
   expired lease or `UNKNOWN` → resolved by the policy (inline or by the background reconciler).
-* Every later write is a compare-and-set on `attempt` (the fencing token): a success uses
+* Every later write is a compare-and-set on `attempt` (the fencing token; extended by the row's creation time in
+  ADR-0007, because retention lets a key start again at attempt 1): a success uses
   `… WHERE key_hash = ? AND attempt = ? AND state <> 'SUCCEEDED'`, so a late result of the *same* attempt still lands
   after the reconciler marked it `UNKNOWN`/`FAILED`/`ESCALATED`, while a worker whose attempt was superseded gets 0 rows.
 * **What fencing does and does not do:** it guarantees one *live lease* per key and that only the current attempt

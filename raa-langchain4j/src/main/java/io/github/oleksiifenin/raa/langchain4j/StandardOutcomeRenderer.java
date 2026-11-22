@@ -10,6 +10,9 @@ final class StandardOutcomeRenderer implements OutcomeRenderer {
 
     /** The runner states the time in its reason ("… call again after 2026-11-16T10:00:00Z"). */
     private static final Pattern CALL_AGAIN_AFTER = Pattern.compile("call again after (\\S+)");
+    /** A replay of a succeeded action whose result was redacted. */
+    private static final String RESULT_REMOVED = "this action was already performed; its recorded result was removed"
+            + " from the journal; do not repeat";
 
     @Override
     public String render(ActionOutcome outcome, ToolCall call) {
@@ -17,12 +20,17 @@ final class StandardOutcomeRenderer implements OutcomeRenderer {
             return ((ActionOutcome.Succeeded) outcome).resultText();
         }
         if (outcome instanceof ActionOutcome.Replayed) {
-            return ((ActionOutcome.Replayed) outcome).resultText();
+            ActionOutcome.Replayed replayed = (ActionOutcome.Replayed) outcome;
+            return replayed.resultRedacted() ? RESULT_REMOVED : replayed.resultText();
         }
         if (outcome instanceof ActionOutcome.Conflict) {
             ActionOutcome.Conflict conflict = (ActionOutcome.Conflict) outcome;
-            return conflict.previousUnresolved()
-                    ? "a previous attempt with different arguments has an unknown outcome; not performed"
+            if (conflict.previousUnresolved()) {
+                return "a previous attempt with different arguments has an unknown outcome; not performed";
+            }
+            return conflict.recordedResultText() == null
+                    ? "this action was already performed; its recorded result was removed from the journal; it was not"
+                            + " performed again"
                     : "this action was already performed: " + conflict.recordedResultText()
                             + "; it was not performed again";
         }

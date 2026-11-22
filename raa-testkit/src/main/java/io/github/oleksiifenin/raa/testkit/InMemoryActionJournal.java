@@ -13,6 +13,7 @@ import io.github.oleksiifenin.raa.storage.FailureKind;
 import io.github.oleksiifenin.raa.storage.JournalException;
 import io.github.oleksiifenin.raa.storage.JournalWrite;
 import io.github.oleksiifenin.raa.storage.KeyAttempt;
+import io.github.oleksiifenin.raa.storage.ManualResolution;
 import io.github.oleksiifenin.raa.storage.RecordOutcome;
 import io.github.oleksiifenin.raa.storage.RecordResult;
 import io.github.oleksiifenin.raa.storage.Resolution;
@@ -27,14 +28,12 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
@@ -45,6 +44,8 @@ import java.util.regex.Pattern;
  * An in-memory action journal for tests, with per-key transaction locks and PostgreSQL's microsecond precision.
  * The supplied clock is the journal's database clock; decisions sample it after acquiring their row locks.
  * Rows and call history live only as long as this instance and are not durable across process termination.
+ * Retention removes a row under its lock and marks it deleted, so an operation that found it before and locks it
+ * afterwards treats it as missing.
  */
 public final class InMemoryActionJournal implements ActionJournal {
 
@@ -106,6 +107,9 @@ public final class InMemoryActionJournal implements ActionJournal {
             } else {
                 row.lock.lock();
                 try {
+                    if (row.deleted) {
+                        continue; // retention removed it meanwhile: decide again without a row
+                    }
                     ClaimDecision decision = decider.decide(request, Optional.of(row.record), now());
                     ActionRecord updated = applyClaim(request, row.record, decision.write());
                     commitClaim(key, row, updated, request, decision, false);
@@ -127,7 +131,7 @@ public final class InMemoryActionJournal implements ActionJournal {
                 time.plus(interval(request.lease())),
                 interval(request.maxEffectDuration()), time, time.plus(interval(request.deadline())), time, time,
                 null, 0, null, request.allArgsHash().clone(), request.scopeHash().clone(),
-                request.materialArgsHash().clone(), arguments, null, null);
+                request.materialArgsHash().clone(), arguments, null, null, null);
     }
 
     private ActionRecord applyClaim(ClaimRequest request, ActionRecord current, JournalWrite write) {
@@ -202,29 +206,31 @@ public final class InMemoryActionJournal implements ActionJournal {
     }
 
     @Override
-    public RecordResult recordSuccess(byte[] keyHash, int attempt, String resultText) {
-        Objects.requireNonNull(keyHash, "keyHash");
+    public RecordResult recordSuccess(KeyAttempt attempt, String resultText) {
+        Objects.requireNonNull(attempt, "attempt");
         Objects.requireNonNull(resultText, "resultText");
-        return record(keyHash, attempt, null, resultText);
+        return record(attempt, null, resultText);
     }
 
     @Override
-    public RecordResult recordFailure(byte[] keyHash, int attempt, FailureKind kind, String error) {
-        Objects.requireNonNull(keyHash, "keyHash");
+    public RecordResult recordFailure(KeyAttempt attempt, FailureKind kind, String error) {
+        Objects.requireNonNull(attempt, "attempt");
         Objects.requireNonNull(kind, "kind");
-        return record(keyHash, attempt, kind, error);
+        return record(attempt, kind, error);
     }
 
-    private RecordResult record(byte[] keyHash, int attempt, FailureKind failure, String text) {
-        Row row = rows.get(hash(keyHash));
+    private RecordResult record(KeyAttempt attempt, FailureKind failure, String text) {
+        Row row = lockLive(hash(attempt.keyHash()));
         if (row == null) {
             return new RecordResult(RecordOutcome.MISSING, Optional.empty(), Optional.empty());
         }
-        row.lock.lock();
         try {
             ActionRecord before = row.record;
+            if (!attempt.isOf(before)) {
+                return new RecordResult(RecordOutcome.MISSING, Optional.empty(), Optional.empty());
+            }
             RecordOutcome outcome;
-            if (before.attempt() != attempt) {
+            if (before.attempt() != attempt.attempt()) {
                 outcome = RecordOutcome.SUPERSEDED;
             } else if (before.state() == ActionState.SUCCEEDED) {
                 outcome = RecordOutcome.ALREADY_SUCCEEDED;
@@ -259,17 +265,16 @@ public final class InMemoryActionJournal implements ActionJournal {
     }
 
     @Override
-    public boolean markUnknownIfLeaseExpired(byte[] keyHash, int attempt, String reason) {
-        Objects.requireNonNull(keyHash, "keyHash");
-        Row row = rows.get(hash(keyHash));
+    public boolean markUnknownIfLeaseExpired(KeyAttempt attempt, String reason) {
+        Objects.requireNonNull(attempt, "attempt");
+        Row row = lockLive(hash(attempt.keyHash()));
         if (row == null) {
             return false;
         }
-        row.lock.lock();
         try {
             Instant time = now();
             ActionRecord current = row.record;
-            if (current.attempt() != attempt || current.state() != ActionState.EXECUTING
+            if (!attempt.isCurrentAttemptOf(current) || current.state() != ActionState.EXECUTING
                     || current.leaseUntil() == null || !current.leaseUntil().isBefore(time)) {
                 return false;
             }
@@ -296,15 +301,15 @@ public final class InMemoryActionJournal implements ActionJournal {
         if (inFlight.isEmpty()) {
             return 0;
         }
-        Map<String, Set<Integer>> attempts = new TreeMap<>();
+        Map<String, List<KeyAttempt>> attempts = new TreeMap<>();
         for (KeyAttempt target : inFlight) {
-            attempts.computeIfAbsent(hash(target.keyHash()), ignored -> new HashSet<>()).add(target.attempt());
+            attempts.computeIfAbsent(hash(target.keyHash()), ignored -> new ArrayList<>()).add(target);
         }
         List<Row> locked = new ArrayList<>();
         try {
-            for (Map.Entry<String, Set<Integer>> entry : attempts.entrySet()) {
+            for (Map.Entry<String, List<KeyAttempt>> entry : attempts.entrySet()) {
                 Row row = rows.get(entry.getKey());
-                if (row != null && entry.getValue().contains(row.record.attempt())) {
+                if (row != null && entry.getValue().stream().anyMatch(target -> target.isCurrentAttemptOf(row.record))) {
                     row.lock.lock();
                     locked.add(row);
                 }
@@ -314,7 +319,8 @@ public final class InMemoryActionJournal implements ActionJournal {
             Map<Row, ActionRecord> updates = new LinkedHashMap<>();
             for (Row row : locked) {
                 ActionRecord current = row.record;
-                if (attempts.get(hash(current.keyHash())).contains(current.attempt())
+                if (!row.deleted && attempts.get(hash(current.keyHash())).stream()
+                        .anyMatch(target -> target.isCurrentAttemptOf(current))
                         && current.state() == ActionState.EXECUTING && owner.equals(current.leaseOwner())
                         && time.isBefore(current.startedAt().plus(current.maxEffectDuration()))) {
                     Update update = new Update(current);
@@ -356,7 +362,7 @@ public final class InMemoryActionJournal implements ActionJournal {
                     time = now();
                 }
                 ActionRecord current = row.record;
-                if (needsReconciliation(current, time)) {
+                if (!row.deleted && needsReconciliation(current, time)) {
                     Update update = new Update(current);
                     update.resolveAfter = time.plus(length);
                     updates.put(row, update.record());
@@ -385,18 +391,17 @@ public final class InMemoryActionJournal implements ActionJournal {
     }
 
     @Override
-    public boolean resolve(byte[] keyHash, int attempt, Resolution resolution) {
-        Objects.requireNonNull(keyHash, "keyHash");
+    public boolean resolve(KeyAttempt attempt, Resolution resolution) {
+        Objects.requireNonNull(attempt, "attempt");
         Objects.requireNonNull(resolution, "resolution");
-        Row row = rows.get(hash(keyHash));
+        Row row = lockLive(hash(attempt.keyHash()));
         if (row == null) {
             return false;
         }
-        row.lock.lock();
         try {
             ActionRecord current = row.record;
             ActionState source = resolution instanceof Resolution.Abandon ? ActionState.FAILED : ActionState.UNKNOWN;
-            if (current.attempt() != attempt || current.state() != source) {
+            if (!attempt.isCurrentAttemptOf(current) || current.state() != source) {
                 return false;
             }
             Instant time = now();
@@ -439,6 +444,149 @@ public final class InMemoryActionJournal implements ActionJournal {
             }
             return Optional.of(new CallRecord(providerCallId, mapping.attempt(), mapping.seenAt(),
                     rows.get(mapping.key()).record));
+        }
+    }
+
+    @Override
+    public int deleteTerminalOlderThan(Duration retention, int batchSize) {
+        Objects.requireNonNull(retention, "retention");
+        if (retention.isNegative() || retention.isZero()) {
+            throw new IllegalArgumentException("retention must be positive: " + retention);
+        }
+        if (batchSize < 1) {
+            throw new IllegalArgumentException("batchSize must be at least 1: " + batchSize);
+        }
+        Instant cutoff = now().minus(interval(retention));
+        List<Candidate> candidates = new ArrayList<>();
+        synchronized (commitMonitor) {
+            rows.forEach((key, row) -> candidates.add(new Candidate(key, row, row.record)));
+        }
+        candidates.sort(Comparator.comparing((Candidate candidate) -> candidate.snapshot().updatedAt())
+                .thenComparing(Candidate::key));
+        int deleted = 0;
+        for (Candidate candidate : candidates) {
+            if (deleted == batchSize) {
+                break;
+            }
+            Row row = candidate.row();
+            if (!row.lock.tryLock()) {
+                continue; // skip locked, like FOR UPDATE SKIP LOCKED
+            }
+            try {
+                ActionRecord current = row.record;
+                if (row.deleted || !isTerminal(current.state()) || !current.updatedAt().isBefore(cutoff)) {
+                    continue;
+                }
+                synchronized (commitMonitor) {
+                    rows.remove(candidate.key(), row);
+                    history.values().removeIf(mapping -> mapping.key().equals(candidate.key()));
+                    row.deleted = true;
+                }
+                deleted++;
+            } finally {
+                row.lock.unlock();
+            }
+        }
+        return deleted;
+    }
+
+    @Override
+    public List<ActionRecord> find(ActionState state, int limit) {
+        Objects.requireNonNull(state, "state");
+        if (limit < 1) {
+            throw new IllegalArgumentException("limit must be at least 1: " + limit);
+        }
+        List<Candidate> found = new ArrayList<>();
+        synchronized (commitMonitor) {
+            rows.forEach((key, row) -> {
+                if (row.record.state() == state) {
+                    found.add(new Candidate(key, row, row.record));
+                }
+            });
+        }
+        return found.stream()
+                .sorted(Comparator.comparing((Candidate candidate) -> candidate.snapshot().updatedAt())
+                        .thenComparing(Candidate::key))
+                .limit(limit)
+                .map(Candidate::snapshot)
+                .toList();
+    }
+
+    @Override
+    public long count(ActionState state) {
+        Objects.requireNonNull(state, "state");
+        synchronized (commitMonitor) {
+            return rows.values().stream().filter(row -> row.record.state() == state).count();
+        }
+    }
+
+    @Override
+    public boolean resolveManually(KeyAttempt attempt, ManualResolution resolution) {
+        Objects.requireNonNull(attempt, "attempt");
+        Objects.requireNonNull(resolution, "resolution");
+        Row row = lockLive(hash(attempt.keyHash()));
+        if (row == null) {
+            return false;
+        }
+        try {
+            ActionRecord current = row.record;
+            if (!attempt.isCurrentAttemptOf(current) || current.state() != ActionState.ESCALATED) {
+                return false;
+            }
+            Update update = new Update(current);
+            update.updatedAt = now();
+            update.resolveAfter = null;
+            if (resolution instanceof ManualResolution.Applied) {
+                update.state = ActionState.SUCCEEDED;
+                update.resultText = columnText(((ManualResolution.Applied) resolution).resultText(),
+                        Integer.MAX_VALUE);
+                update.failureBasis = null;
+            } else {
+                update.state = ActionState.ABANDONED;
+                update.lastError = ManualResolution.NOT_APPLIED_ERROR;
+            }
+            publish(row, update.record());
+            return true;
+        } finally {
+            row.lock.unlock();
+        }
+    }
+
+    @Override
+    public boolean redact(byte[] keyHash) {
+        Objects.requireNonNull(keyHash, "keyHash");
+        Row row = lockLive(hash(keyHash));
+        if (row == null) {
+            return false;
+        }
+        try {
+            Update update = new Update(row.record);
+            if (update.redactedAt == null) {
+                update.redactedAt = now();
+            }
+            publish(row, update.record()); // the update time stays
+            return true;
+        } finally {
+            row.lock.unlock();
+        }
+    }
+
+    private static boolean isTerminal(ActionState state) {
+        return state == ActionState.SUCCEEDED || state == ActionState.ABANDONED;
+    }
+
+    /** The row of {@code key}, locked, or {@code null} if there is none; never a row retention removed. */
+    private Row lockLive(String key) {
+        while (true) {
+            Row row = rows.get(key);
+            if (row == null) {
+                return null;
+            }
+            row.lock.lock();
+            if (!row.deleted) {
+                return row;
+            }
+            row.lock.unlock(); // removed from the map meanwhile; look again
         }
     }
 
@@ -501,6 +649,8 @@ public final class InMemoryActionJournal implements ActionJournal {
     private static final class Row {
         private final ReentrantLock lock = new ReentrantLock();
         private volatile ActionRecord record;
+        /** Set under the row lock when retention removed the row; it is then never written again. */
+        private volatile boolean deleted;
     }
 
     private record CallKey(String scope, String callId) {}
@@ -530,6 +680,7 @@ public final class InMemoryActionJournal implements ActionJournal {
         private String argumentsJson;
         private String resultText;
         private String lastError;
+        private Instant redactedAt;
 
         private Update(ActionRecord row) {
             original = row;
@@ -551,13 +702,17 @@ public final class InMemoryActionJournal implements ActionJournal {
             argumentsJson = row.argumentsJson();
             resultText = row.resultText();
             lastError = row.lastError();
+            redactedAt = row.redactedAt();
         }
 
+        /** The staged row; a redacted row keeps none of its texts. */
         private ActionRecord record() {
-            return new ActionRecord(original.keyHash(), keyText, toolName, policy, state, attempt, leaseOwner,
-                    leaseUntil, maxEffectDuration, original.createdAt(), original.deadlineAt(), startedAt, updatedAt,
-                    resolveAfter, lookupFailures, failureBasis, allArgsHash, original.scopeHash(), materialArgsHash,
-                    argumentsJson, resultText, lastError);
+            boolean redacted = redactedAt != null;
+            return new ActionRecord(original.keyHash(), redacted ? null : keyText, toolName, policy, state, attempt,
+                    leaseOwner, leaseUntil, maxEffectDuration, original.createdAt(), original.deadlineAt(), startedAt,
+                    updatedAt, resolveAfter, lookupFailures, failureBasis, allArgsHash, original.scopeHash(),
+                    materialArgsHash, redacted ? null : argumentsJson, redacted ? null : resultText,
+                    redacted ? null : lastError, redactedAt);
         }
     }
 

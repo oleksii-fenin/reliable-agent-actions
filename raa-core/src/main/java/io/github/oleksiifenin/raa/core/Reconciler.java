@@ -3,6 +3,7 @@ package io.github.oleksiifenin.raa.core;
 import io.github.oleksiifenin.raa.storage.ActionJournal;
 import io.github.oleksiifenin.raa.storage.ActionRecord;
 import io.github.oleksiifenin.raa.storage.JournalException;
+import io.github.oleksiifenin.raa.storage.KeyAttempt;
 import io.github.oleksiifenin.raa.storage.Resolution;
 import java.time.Duration;
 import java.time.Instant;
@@ -20,6 +21,9 @@ import java.util.Objects;
  * <p>Time comes from the database only: rows taken by {@link ActionJournal#takeReconcileBatch} carry
  * {@code resolve_after = clock_timestamp() + hold}, so {@code resolve_after - hold} is the database time of the take.
  *
+ * <p>Each run also applies retention: it deletes one batch of {@code SUCCEEDED}/{@code ABANDONED} rows older than
+ * {@link ReliableActions.Builder#retention(Duration)} ({@link ActionJournal#deleteTerminalOlderThan}).
+ *
  * <p>A lookup needs the action key, which the journal has only as text when {@link
  * ReliableActions.Builder#storeKeyText(boolean)} is on (ADR-0004). Rows without usable key text are left to the next
  * call, which looks up inline, and are escalated at their deadline.
@@ -30,6 +34,8 @@ public final class Reconciler {
     static final Duration DEFAULT_HOLD = Duration.ofMinutes(2);
     /** Rows per {@link #runOnce()}. */
     static final int DEFAULT_BATCH_SIZE = 20;
+    /** Finished rows deleted per {@link #runOnce()} at most (docs/DESIGN.md §7). */
+    static final int RETENTION_BATCH_SIZE = 1000;
 
     private static final System.Logger LOG = System.getLogger(Reconciler.class.getName());
 
@@ -37,12 +43,14 @@ public final class Reconciler {
     private final Map<String, ActionPolicy> policies;
     private final Duration hold;
     private final int batchSize;
+    private final Duration retention;
     private final TimedLookup timedLookup = new TimedLookup();
 
     private final ActionTelemetry telemetry;
 
     Reconciler(ActionJournal journal, Map<String, ActionPolicy> policies, Duration hold, int batchSize,
-            ActionTelemetry telemetry) {
+            Duration retention, ActionTelemetry telemetry) {
+        this.retention = Objects.requireNonNull(retention, "retention");
         this.telemetry = Objects.requireNonNull(telemetry, "telemetry");
         this.journal = Objects.requireNonNull(journal, "journal");
         this.policies = Objects.requireNonNull(policies, "policies");
@@ -51,8 +59,9 @@ public final class Reconciler {
     }
 
     /**
-     * Takes one batch and handles every row in it. A journal failure on one row is logged and the next row is handled;
-     * the failed row is taken again after the hold.
+     * Takes one batch and handles every row in it, then deletes one batch of finished rows past the retention. A
+     * journal failure on one row is logged and the next row is handled; the failed row is taken again after the hold.
+     * A failure of the retention delete is logged; the next run deletes again.
      *
      * @return the number of rows taken
      * @throws JournalException if the batch itself cannot be taken
@@ -67,6 +76,13 @@ public final class Reconciler {
                 reconcile(row);
             } catch (JournalException e) {
                 LOG.log(System.Logger.Level.WARNING, "could not reconcile an action of tool " + row.toolName(), e);
+            }
+        }
+        if (!Thread.currentThread().isInterrupted()) {
+            try {
+                journal.deleteTerminalOlderThan(retention, RETENTION_BATCH_SIZE);
+            } catch (JournalException e) {
+                LOG.log(System.Logger.Level.WARNING, "could not delete finished actions past the retention", e);
             }
         }
         return batch.size();
@@ -85,7 +101,7 @@ public final class Reconciler {
         switch (row.state()) {
             case EXECUTING:
                 // The next batch takes the row as UNKNOWN: markUnknownIfLeaseExpired sets resolve_after = now.
-                if (journal.markUnknownIfLeaseExpired(row.keyHash(), row.attempt(),
+                if (journal.markUnknownIfLeaseExpired(KeyAttempt.of(row),
                         "the lease expired; the process running the attempt is presumed dead")) {
                     telemetry.signal(ActionSignal.LEASE_EXPIRED, row.toolName());
                     telemetry.reconcilerResolution(ReconcilerResult.MARKED_UNKNOWN, row.toolName());
@@ -129,7 +145,7 @@ public final class Reconciler {
 
     /** Writes a resolution and reports it if it landed. */
     private void resolve(ActionRecord row, Resolution resolution) {
-        if (journal.resolve(row.keyHash(), row.attempt(), resolution)) {
+        if (journal.resolve(KeyAttempt.of(row), resolution)) {
             telemetry.reconcilerResolution(resultOf(resolution), row.toolName());
         }
     }

@@ -2,6 +2,7 @@ package io.github.oleksiifenin.raa.core;
 
 import io.github.oleksiifenin.raa.storage.ActionJournal;
 import io.github.oleksiifenin.raa.storage.ActionRecord;
+import io.github.oleksiifenin.raa.storage.ActionState;
 import io.github.oleksiifenin.raa.storage.CallRecord;
 import io.github.oleksiifenin.raa.storage.ClaimDecider;
 import io.github.oleksiifenin.raa.storage.ClaimRequest;
@@ -9,6 +10,7 @@ import io.github.oleksiifenin.raa.storage.ClaimResult;
 import io.github.oleksiifenin.raa.storage.FailureKind;
 import io.github.oleksiifenin.raa.storage.JournalException;
 import io.github.oleksiifenin.raa.storage.KeyAttempt;
+import io.github.oleksiifenin.raa.storage.ManualResolution;
 import io.github.oleksiifenin.raa.storage.RecordResult;
 import io.github.oleksiifenin.raa.storage.Resolution;
 import java.time.Duration;
@@ -42,18 +44,18 @@ final class ObservedJournal implements ActionJournal {
     }
 
     @Override
-    public RecordResult recordSuccess(byte[] keyHash, int attempt, String resultText) {
-        return timed("recordSuccess", () -> delegate.recordSuccess(keyHash, attempt, resultText));
+    public RecordResult recordSuccess(KeyAttempt attempt, String resultText) {
+        return timed("recordSuccess", () -> delegate.recordSuccess(attempt, resultText));
     }
 
     @Override
-    public RecordResult recordFailure(byte[] keyHash, int attempt, FailureKind kind, String error) {
-        return timed("recordFailure", () -> delegate.recordFailure(keyHash, attempt, kind, error));
+    public RecordResult recordFailure(KeyAttempt attempt, FailureKind kind, String error) {
+        return timed("recordFailure", () -> delegate.recordFailure(attempt, kind, error));
     }
 
     @Override
-    public boolean markUnknownIfLeaseExpired(byte[] keyHash, int attempt, String reason) {
-        return timed("markUnknownIfLeaseExpired", () -> delegate.markUnknownIfLeaseExpired(keyHash, attempt, reason));
+    public boolean markUnknownIfLeaseExpired(KeyAttempt attempt, String reason) {
+        return timed("markUnknownIfLeaseExpired", () -> delegate.markUnknownIfLeaseExpired(attempt, reason));
     }
 
     @Override
@@ -67,13 +69,38 @@ final class ObservedJournal implements ActionJournal {
     }
 
     @Override
-    public boolean resolve(byte[] keyHash, int attempt, Resolution resolution) {
-        return timed("resolve", () -> delegate.resolve(keyHash, attempt, resolution));
+    public boolean resolve(KeyAttempt attempt, Resolution resolution) {
+        return timed("resolve", () -> delegate.resolve(attempt, resolution));
     }
 
     @Override
     public Optional<CallRecord> findByProviderCallId(byte[] scopeHash, String providerCallId) {
         return timed("findByProviderCallId", () -> delegate.findByProviderCallId(scopeHash, providerCallId));
+    }
+
+    @Override
+    public int deleteTerminalOlderThan(Duration retention, int batchSize) {
+        return timed("deleteTerminalOlderThan", () -> delegate.deleteTerminalOlderThan(retention, batchSize));
+    }
+
+    @Override
+    public List<ActionRecord> find(ActionState state, int limit) {
+        return timed("find", () -> delegate.find(state, limit));
+    }
+
+    @Override
+    public long count(ActionState state) {
+        return timed("count", () -> delegate.count(state));
+    }
+
+    @Override
+    public boolean resolveManually(KeyAttempt attempt, ManualResolution resolution) {
+        return timed("resolveManually", () -> delegate.resolveManually(attempt, resolution));
+    }
+
+    @Override
+    public boolean redact(byte[] keyHash) {
+        return timed("redact", () -> delegate.redact(keyHash));
     }
 
     /** Reports the duration; failed only for a {@link JournalException}, not for an exception of the decider. */

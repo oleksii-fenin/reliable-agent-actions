@@ -7,6 +7,7 @@ import io.github.oleksiifenin.raa.storage.ActionRecord;
 import io.github.oleksiifenin.raa.storage.ActionState;
 import io.github.oleksiifenin.raa.storage.FailureBasis;
 import io.github.oleksiifenin.raa.storage.FailureKind;
+import io.github.oleksiifenin.raa.storage.KeyAttempt;
 import io.github.oleksiifenin.raa.storage.Resolution;
 import io.github.oleksiifenin.raa.testkit.InMemoryActionJournal;
 import java.io.IOException;
@@ -113,6 +114,22 @@ class ActionRunnerTest {
         ActionOutcome outcome = runner.run(call("c2", "order-42", "20"), succeeding("refunded 20"));
 
         assertThat(outcome).isEqualTo(new ActionOutcome.Conflict(null, true));
+        assertThat(effects).hasValue(1);
+    }
+
+    @Test
+    void redactedResult_isReplayedAsRemoved_andAConflictCarriesNoText_andNothingRunsAgain() {
+        ActionRunner runner = runner(ActionPolicy.atMostOnce());
+        runner.run(call("c1", "order-42", "10"), succeeding("refunded 10 to jane@example.com"));
+        journal.redact(row("c1").keyHash());
+
+        ActionOutcome replayed = runner.run(call("c2", "order-42", "10"), succeeding("again"));
+        ActionOutcome inspected = runner.inspect(call("c2", "order-42", "10")); // memory repair of that call
+        ActionOutcome conflict = runner.run(call("c4", "order-42", "20"), succeeding("refunded 20"));
+
+        assertThat(replayed).isEqualTo(new ActionOutcome.Replayed("", row("c1").updatedAt(), false, true));
+        assertThat(inspected).isEqualTo(replayed);
+        assertThat(conflict).isEqualTo(new ActionOutcome.Conflict(null, false));
         assertThat(effects).hasValue(1);
     }
 
@@ -387,7 +404,7 @@ class ActionRunnerTest {
         runner.run(call("c1", "order-42", "10"), failing(new IOException("reset")));
         clock.advance(MAX_EFFECT.plusMillis(1));
         // A reconciler's lookup was unreachable: the row now backs off for 15 s.
-        journal.resolve(ORDER_42.hash(), 1, new Resolution.LookupUnreachable(Duration.ofSeconds(15)));
+        journal.resolve(KeyAttempt.of(row("c1")), new Resolution.LookupUnreachable(Duration.ofSeconds(15)));
 
         ActionOutcome outcome = runner.run(call("c2", "order-42", "10"), succeeding("refunded"));
 
@@ -405,7 +422,7 @@ class ActionRunnerTest {
         }).deadline(Duration.ofMinutes(5)));
         runner.run(call("c1", "order-42", "10"), failing(new IOException("reset")));
         clock.advance(MAX_EFFECT.plusMillis(1));
-        journal.resolve(ORDER_42.hash(), 1, new Resolution.LookupUnreachable(Duration.ofMinutes(10)));
+        journal.resolve(KeyAttempt.of(row("c1")), new Resolution.LookupUnreachable(Duration.ofMinutes(10)));
 
         ActionOutcome beforeDeadline = runner.run(call("c2", "order-42", "10"), succeeding("refunded"));
         clock.advance(Duration.ofMinutes(5));

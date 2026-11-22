@@ -4,8 +4,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.oleksiifenin.raa.core.ActionKey;
 import io.github.oleksiifenin.raa.storage.ActionJournal;
+import io.github.oleksiifenin.raa.storage.ActionRecord;
+import io.github.oleksiifenin.raa.storage.ActionState;
 import io.github.oleksiifenin.raa.storage.ClaimDecision;
 import io.github.oleksiifenin.raa.storage.ClaimRequest;
+import io.github.oleksiifenin.raa.storage.ClaimResult;
 import io.github.oleksiifenin.raa.storage.ClaimVerdict;
 import io.github.oleksiifenin.raa.storage.JournalException;
 import io.github.oleksiifenin.raa.storage.JournalWrite;
@@ -15,8 +18,11 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
@@ -54,8 +60,8 @@ class PostgresTransactionTest {
         for (int round = 0; round < 10; round++) {
             ActionJournal journal = PostgresActionJournal.create(database.newDataSource());
             ActionKey key = ActionKey.of("race-" + System.nanoTime(), "refund");
-            journal.claim(request(key), (request, row, now) ->
-                    new ClaimDecision(ClaimVerdict.START, new JournalWrite.StartAttempt(1)));
+            KeyAttempt attempt = KeyAttempt.of(journal.claim(request(key), (request, row, now) ->
+                    new ClaimDecision(ClaimVerdict.START, new JournalWrite.StartAttempt(1))).record());
 
             // Expire the lease (committed), then hold the row lock so both writers queue behind it and race.
             database.execute("update raa_action set lease_until = clock_timestamp() - interval '1 second'"
@@ -68,9 +74,9 @@ class PostgresTransactionTest {
                     assertThat(lock.executeQuery().next()).isTrue();
                 }
                 CompletableFuture<Boolean> marked = CompletableFuture.supplyAsync(
-                        () -> journal.markUnknownIfLeaseExpired(key.hash(), 1, "lease expired"));
+                        () -> journal.markUnknownIfLeaseExpired(attempt, "lease expired"));
                 CompletableFuture<Integer> renewed = CompletableFuture.supplyAsync(
-                        () -> journal.renewLeases("owner-1", List.of(new KeyAttempt(key.hash(), 1)),
+                        () -> journal.renewLeases("owner-1", List.of(attempt),
                                 Duration.ofMinutes(5)));
                 awaitWaitingForLock(2);
                 holder.commit();
@@ -89,10 +95,10 @@ class PostgresTransactionTest {
         ActionJournal journal = PostgresActionJournal.create(database.newDataSource());
         ActionKey key = ActionKey.of("overrun-" + System.nanoTime(), "refund");
         byte[] arguments = key.hash();
-        journal.claim(new ClaimRequest(key.hash(), key.scopeHash(), null, "refund", "AT_LEAST_ONCE", arguments,
-                arguments, null, null, "owner-1", Duration.ofMinutes(5), Duration.ofMillis(500),
-                Duration.ofMinutes(15)), (request, row, now) ->
-                new ClaimDecision(ClaimVerdict.START, new JournalWrite.StartAttempt(1)));
+        KeyAttempt attempt = KeyAttempt.of(journal.claim(new ClaimRequest(key.hash(), key.scopeHash(), null, "refund",
+                "AT_LEAST_ONCE", arguments, arguments, null, null, "owner-1", Duration.ofMinutes(5),
+                Duration.ofMillis(500), Duration.ofMinutes(15)), (request, row, now) ->
+                new ClaimDecision(ClaimVerdict.START, new JournalWrite.StartAttempt(1))).record());
 
         try (Connection holder = database.newDataSource().getConnection()) {
             holder.setAutoCommit(false);
@@ -102,12 +108,47 @@ class PostgresTransactionTest {
                 assertThat(lock.executeQuery().next()).isTrue();
             }
             CompletableFuture<Integer> renewed = CompletableFuture.supplyAsync(() -> journal.renewLeases("owner-1",
-                    List.of(new KeyAttempt(key.hash(), 1)), Duration.ofMinutes(5)));
+                    List.of(attempt), Duration.ofMinutes(5)));
             awaitWaitingForLock(1);
             awaitDatabaseTimePastMaxEffect(key);
             holder.commit();
 
             assertThat(renewed.get(30, TimeUnit.SECONDS)).isZero();
+        }
+    }
+
+    /** DESIGN §9, "retention delete during claim": the claim waits for the delete and then starts attempt 1. */
+    @Test
+    void claimWaitingForARowThatRetentionDeletes_decidesWithoutTheRow() throws Exception {
+        ActionJournal journal = PostgresActionJournal.create(database.newDataSource());
+        ActionKey key = ActionKey.of("retained-" + System.nanoTime(), "refund");
+        ActionRecord claimed = journal.claim(request(key), (request, row, now) ->
+                new ClaimDecision(ClaimVerdict.START, new JournalWrite.StartAttempt(1))).record();
+        journal.recordSuccess(KeyAttempt.of(claimed), "done");
+        List<Optional<ActionRecord>> rowsSeen = new CopyOnWriteArrayList<>();
+
+        try (Connection deleting = database.newDataSource().getConnection()) {
+            deleting.setAutoCommit(false);
+            try (PreparedStatement delete = deleting.prepareStatement(
+                    "delete from raa_action where key_hash = ? and state = 'SUCCEEDED'")) {
+                delete.setBytes(1, key.hash());
+                assertThat(delete.executeUpdate()).isEqualTo(1);
+            }
+            CompletableFuture<ClaimResult> claim = CompletableFuture.supplyAsync(
+                    () -> journal.claim(request(key), (request, row, now) -> {
+                        rowsSeen.add(row);
+                        return row.isPresent()
+                                ? new ClaimDecision(ClaimVerdict.REPLAY, new JournalWrite.None())
+                                : new ClaimDecision(ClaimVerdict.START, new JournalWrite.StartAttempt(1));
+                    }));
+            awaitWaitingForLock(1);
+            deleting.commit();
+
+            ClaimResult result = claim.get(30, TimeUnit.SECONDS);
+            assertThat(rowsSeen).containsExactly(Optional.empty());
+            assertThat(result.decision().verdict()).isEqualTo(ClaimVerdict.START);
+            assertThat(result.record().attempt()).isEqualTo(1);
+            assertThat(result.record().state()).isEqualTo(ActionState.EXECUTING);
         }
     }
 
@@ -141,7 +182,7 @@ class PostgresTransactionTest {
         ActionJournal journal = PostgresActionJournal.create(unreachable);
 
         org.assertj.core.api.Assertions.assertThatThrownBy(
-                        () -> journal.markUnknownIfLeaseExpired(new byte[32], 1, "x"))
+                        () -> journal.markUnknownIfLeaseExpired(new KeyAttempt(new byte[32], Instant.EPOCH, 1), "x"))
                 .isInstanceOf(JournalException.class)
                 .hasMessageContaining("markUnknownIfLeaseExpired")
                 .hasRootCauseMessage("connection refused");

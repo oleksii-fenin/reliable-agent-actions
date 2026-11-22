@@ -281,14 +281,14 @@ public final class ActionRunner {
                 }
                 switch (claim.decision().verdict()) {
                     case START:
-                        return execute(row.attempt());
+                        return execute(KeyAttempt.of(row));
                     case WOULD_START:
                         return wouldStart(row);
                     case REPLAY:
-                        return new ActionOutcome.Replayed(textOf(row), row.updatedAt(), resolvedByOwnLookup);
+                        return replayed(row, resolvedByOwnLookup);
                     case CONFLICT:
                         return row.state() == ActionState.SUCCEEDED
-                                ? new ActionOutcome.Conflict(textOf(row), false)
+                                ? new ActionOutcome.Conflict(row.redactedAt() == null ? textOf(row) : null, false)
                                 : new ActionOutcome.Conflict(null, true);
                     case IN_PROGRESS:
                         if (inspect || !pauseWhileInProgress()) {
@@ -333,8 +333,8 @@ public final class ActionRunner {
         }
 
         /** Runs the effect of a started attempt and records its outcome. */
-        private ActionOutcome execute(int attempt) {
-            KeyAttempt inFlight = new KeyAttempt(request.keyHash(), attempt);
+        private ActionOutcome execute(KeyAttempt inFlight) {
+            int attempt = inFlight.attempt();
             leaseRenewer.register(inFlight);
             leaseRenewer.warnIfNotStarted();
             try {
@@ -345,24 +345,29 @@ public final class ActionRunner {
                     resultText = context.runOnCurrentThread(effect);
                 } catch (Exception e) {
                     boolean effectStarted = !policy.isSideEffectMarkerUsed() || context.sideEffectStarted();
-                    ActionOutcome outcome = recordFailure(attempt, e, effectStarted);
+                    ActionOutcome outcome = recordFailure(inFlight, e, effectStarted);
                     if (e instanceof InterruptedException) {
                         Thread.currentThread().interrupt();
                     }
                     return outcome;
                 }
-                return recordSuccess(attempt, resultText == null ? "" : resultText);
+                return recordSuccess(inFlight, resultText == null ? "" : resultText);
             } finally {
                 leaseRenewer.unregister(inFlight);
             }
         }
 
-        private ActionOutcome recordSuccess(int attempt, String resultText) {
+        private ActionOutcome recordSuccess(KeyAttempt written, String resultText) {
+            int attempt = written.attempt();
             String recordedText = storable(resultText);
-            RecordResult result = withRecordRetries(
-                    () -> journal.recordSuccess(request.keyHash(), attempt, recordedText), attempt);
+            RecordResult result = withRecordRetries(() -> journal.recordSuccess(written, recordedText), attempt);
             if (result != null) {
                 observation.recorded(result.outcome(), attempt);
+                if (result.outcome() == RecordOutcome.MISSING) {
+                    LOG.log(System.Logger.Level.WARNING, "attempt {0} of tool {1} applied its effect, but the journal"
+                            + " has no row for it any more (deleted by retention); the result is not recorded", attempt,
+                            request.toolName());
+                }
                 if (result.outcome() == RecordOutcome.SUPERSEDED) {
                     telemetry.signal(ActionSignal.STALE_SUCCESS, request.toolName());
                     LOG.log(System.Logger.Level.INFO, "stale success: attempt {0} of tool {1} finished after a newer"
@@ -380,23 +385,24 @@ public final class ActionRunner {
             return new ActionOutcome.Succeeded(resultText, attempt);
         }
 
-        private ActionOutcome recordFailure(int attempt, Exception error, boolean effectStarted) {
+        private ActionOutcome recordFailure(KeyAttempt written, Exception error, boolean effectStarted) {
+            int attempt = written.attempt();
             FailureKind kind = classify(error, effectStarted);
             String errorText = message(error);
             String recordedError = storable(errorText);
             RecordResult result = withRecordRetries(
-                    () -> journal.recordFailure(request.keyHash(), attempt, kind, recordedError), attempt);
+                    () -> journal.recordFailure(written, kind, recordedError), attempt);
             if (result != null) {
                 observation.recorded(result.outcome(), attempt);
             }
             if (result != null && result.outcome() == RecordOutcome.ALREADY_SUCCEEDED) {
                 ActionRecord row = result.record().orElseThrow();
-                return new ActionOutcome.Replayed(textOf(row), row.updatedAt(), false);
+                return replayed(row, false);
             }
             if (kind == FailureKind.DEFINITE) {
                 return new ActionOutcome.Failed(errorText, attempt < policy.maxAttempts());
             }
-            return unknownOutcome(attempt, errorText, result);
+            return unknownOutcome(written, errorText, result);
         }
 
         private FailureKind classify(Exception error, boolean effectStarted) {
@@ -410,7 +416,7 @@ public final class ActionRunner {
             }
         }
 
-        private ActionOutcome unknownOutcome(int attempt, String errorText, RecordResult result) {
+        private ActionOutcome unknownOutcome(KeyAttempt written, String errorText, RecordResult result) {
             String reason = "the outcome is unknown: " + errorText;
             if (policy instanceof IdempotentDownstream) {
                 return new ActionOutcome.Unknown(RepeatAdvice.SAFE, reason);
@@ -422,7 +428,7 @@ public final class ActionRunner {
                 // Rows 10/11: nothing can resolve an unknown at-most-once outcome but an operator.
                 if (result != null && result.outcome() == RecordOutcome.APPLIED) {
                     try {
-                        journal.resolve(request.keyHash(), attempt, new Resolution.Escalate(storable(reason)));
+                        journal.resolve(written, new Resolution.Escalate(storable(reason)));
                     } catch (JournalException e) {
                         // The next claim or the reconciler escalates the UNKNOWN row instead.
                         LOG.log(System.Logger.Level.WARNING, "could not escalate an unknown outcome", e);
@@ -527,7 +533,7 @@ public final class ActionRunner {
             }
             try {
                 // A lost compare-and-set means someone else resolved or restarted the row; the next claim sees it.
-                journal.resolve(row.keyHash(), row.attempt(), resolution);
+                journal.resolve(KeyAttempt.of(row), resolution);
             } catch (JournalException e) {
                 // Not "not performed": the lookup may have found the effect. The row stays as it was and is resolved by
                 // the next call or the reconciler.
@@ -604,6 +610,10 @@ public final class ActionRunner {
 
     private static String textOf(ActionRecord row) {
         return Objects.requireNonNullElse(row.resultText(), "");
+    }
+
+    private static ActionOutcome.Replayed replayed(ActionRecord row, boolean fromLookup) {
+        return new ActionOutcome.Replayed(textOf(row), row.updatedAt(), fromLookup, row.redactedAt() != null);
     }
 
     private static String withLastError(String reason, ActionRecord row) {

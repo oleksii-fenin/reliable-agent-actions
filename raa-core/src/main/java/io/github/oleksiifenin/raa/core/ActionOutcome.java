@@ -25,11 +25,14 @@ public sealed interface ActionOutcome {
     /**
      * The action was performed before; its recorded result is returned and nothing was performed again.
      *
-     * @param resultText  the recorded result text
-     * @param completedAt when the result was recorded (database time)
-     * @param fromLookup  whether this call learned the result from an outcome lookup
+     * @param resultText     the recorded result text; empty when the result was redacted
+     * @param completedAt    when the result was recorded (database time)
+     * @param fromLookup     whether this call learned the result from an outcome lookup
+     * @param resultRedacted whether an operator erased the recorded result ({@code ActionAdmin.redact}), so there is
+     *                       none to return
      */
-    record Replayed(String resultText, Instant completedAt, boolean fromLookup) implements ActionOutcome {
+    record Replayed(String resultText, Instant completedAt, boolean fromLookup, boolean resultRedacted)
+            implements ActionOutcome {
         /** Validates the fields. */
         public Replayed {
             Objects.requireNonNull(resultText, "resultText");
@@ -40,7 +43,8 @@ public sealed interface ActionOutcome {
     /**
      * The call has other material arguments than the recorded action; nothing was performed.
      *
-     * @param recordedResultText the recorded result if the action succeeded, otherwise {@code null}
+     * @param recordedResultText the recorded result if the action succeeded and its result was not redacted,
+     *                           otherwise {@code null}
      * @param previousUnresolved whether the earlier attempt's outcome is still unknown or in progress
      */
     record Conflict(String recordedResultText, boolean previousUnresolved) implements ActionOutcome {}

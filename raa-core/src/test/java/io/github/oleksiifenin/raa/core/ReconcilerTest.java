@@ -282,6 +282,47 @@ class ReconcilerTest {
                 .isNull();
     }
 
+    // ---- retention
+
+    @Test
+    void eachRun_deletesFinishedActionsOlderThanTheRetention_soTheirKeyExecutesAgain() {
+        ReliableActions actions = ReliableActions.builder(journal)
+                .tool("refund", ActionPolicy.atLeastOnce().key(BY_ORDER).maxEffectDuration(MAX_EFFECT))
+                .lease(LEASE).retention(Duration.ofDays(7)).build();
+        actions.runner().run(call("c1"), context -> "refunded r-1");
+        fail(actions(ActionPolicy.atLeastOnce(), false), "c9", "order-9"); // UNKNOWN: never deleted
+
+        clock.advance(Duration.ofDays(7));
+        actions.reconciler().runOnce();
+        boolean keptAtTheRetention = journal.findByProviderCallId(ORDER_42.scopeHash(), "c1").isPresent();
+        clock.advance(Duration.ofMillis(1));
+        actions.reconciler().runOnce();
+
+        assertThat(keptAtTheRetention).isTrue();
+        assertThat(journal.findByProviderCallId(ORDER_42.scopeHash(), "c1")).isEmpty();
+        assertThat(journal.findByProviderCallId(ORDER_42.scopeHash(), "c9")).isPresent();
+        AtomicInteger effects = new AtomicInteger();
+        assertThat(actions.runner().run(call("c2"), context -> "refunded r-2 " + effects.incrementAndGet()))
+                .isEqualTo(new ActionOutcome.Succeeded("refunded r-2 1", 1));
+    }
+
+    @Test
+    void aFailingRetentionDelete_isLogged_andTheRunStillReturns() {
+        FaultyJournal faulty = new FaultyJournal(journal);
+        faulty.failDeletes.set(true);
+        ReliableActions actions = ReliableActions.builder(faulty)
+                .tool("refund", ActionPolicy.atLeastOnce().key(BY_ORDER).maxEffectDuration(MAX_EFFECT))
+                .lease(LEASE).build();
+        crash(actions);
+        clock.advance(LEASE.plusMillis(1));
+
+        int taken = actions.reconciler().runOnce();
+
+        assertThat(taken).isEqualTo(1);
+        assertThat(row().state()).isEqualTo(ActionState.UNKNOWN);
+        assertThat(faulty.deleteCalls).hasValue(1);
+    }
+
     // ---- helpers
 
     private ReliableActions actions(JournaledPolicy<?> policy, boolean storeKeyText) {
@@ -301,7 +342,11 @@ class ReconcilerTest {
 
     /** First call ends UNKNOWN: an indeterminate error. */
     private void fail(ReliableActions actions) {
-        actions.runner().run(call("c1"), context -> {
+        fail(actions, "c1", "order-42");
+    }
+
+    private static void fail(ReliableActions actions, String callId, String orderId) {
+        actions.runner().run(call(callId, orderId), context -> {
             throw new IOException("connection reset");
         });
     }

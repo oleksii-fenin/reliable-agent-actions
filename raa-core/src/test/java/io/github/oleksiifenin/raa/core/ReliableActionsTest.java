@@ -72,6 +72,17 @@ class ReliableActionsTest {
                 .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> builder.recordRetryBudget(Duration.ZERO))
                 .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> builder.retention(Duration.ZERO)).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void build_rejectsARetentionNotLongerThanAToolsDeadline() {
+        ReliableActions.Builder builder = ReliableActions.builder(UNUSED_JOURNAL).retention(Duration.ofMinutes(15))
+                .tool("refund", ActionPolicy.atLeastOnce().key(KEY).maxEffectDuration(Duration.ofSeconds(10)));
+
+        assertThatThrownBy(builder::build).isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("tool refund").hasMessageContaining("must exceed the deadline PT15M");
+        assertThat(builder.retention(Duration.ofMinutes(16)).build()).isNotNull();
     }
 
     @Test

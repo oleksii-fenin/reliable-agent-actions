@@ -35,7 +35,7 @@ meaning, and an explicit rule for what to do when the outcome is unknown.
 
 | Guaranteed (when configured as documented) | **Not** guaranteed |
 |---|---|
-| For one action key, at most one attempt holds a live lease, and only the current attempt can change the journal (unique key + lease + fencing token) | Stopping a *paused* stale attempt from reaching the external system — only a downstream idempotency key prevents that duplicate; hence `IDEMPOTENT_DOWNSTREAM` for anything that matters |
+| For one action key, at most one attempt holds a live lease, and only the current attempt can change the journal (unique key + lease + fencing token; the token includes the row's creation time, so it also holds after retention deleted a row and the key was used again, [ADR-0007](docs/adr/0007-fencing-token-includes-the-row-generation.md)) | Stopping a *paused* stale attempt from reaching the external system — only a downstream idempotency key prevents that duplicate; hence `IDEMPOTENT_DOWNSTREAM` for anything that matters |
 | | Exactly-once against a system that offers neither an idempotency key nor an outcome lookup — impossible in general; such tools must choose `AT_MOST_ONCE` or `AT_LEAST_ONCE` |
 | A succeeded action is never re-executed; a repeated call returns the **recorded result**; the same key with different material arguments returns an explicit conflict | Deduplication when the model changes the arguments the key is built from — that is a different action by design |
 | An unknown outcome (crash, timeout) is never retried silently: it becomes `UNKNOWN` and is resolved only as the tool's policy allows | `RECONCILABLE` tools: a process paused longer than its lease *before* its request lands can still cause a duplicate after a "not found" lookup. Use `IDEMPOTENT_DOWNSTREAM` for money |
@@ -91,6 +91,14 @@ tool call**, one that **pauses** it past its lease, and negative controls provin
   per call (child of the current span, with policy, key hash, attempt and outcome; state transitions as events), the
   `execute_tool` span of the GenAI conventions around it, and the counters and journal-duration histogram; a telemetry
   that throws never changes an action. The gauge of unresolved actions comes with the operator API (week 7).
+* **Verified — retention, operator API, redaction** on PostgreSQL and the in-memory journal
+  ([`ActionJournalTck`](raa-journal-tck/src/main/java/io/github/oleksiifenin/raa/tck/ActionJournalTck.java)): every
+  reconciler run deletes finished actions older than the retention (default 7 days), never an unresolved one;
+  `ReliableActions.admin()` lists and counts actions by state and lets an operator resolve an escalated action as
+  applied or not applied (compare-and-set, so a late result is never overwritten); `redact` erases the key text,
+  arguments, result and error of an action (for example on a personal-data request) while the key stays deduplicated,
+  and nothing written to that action later stores a text again. The model is then told that the action was performed
+  and its result removed.
 * **Argued, not verified yet:** failover behavior, overhead.
 
 ## Quick start (API as implemented, not released)

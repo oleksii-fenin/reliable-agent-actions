@@ -2,6 +2,7 @@ package io.github.oleksiifenin.raa.core;
 
 import io.github.oleksiifenin.raa.storage.ActionJournal;
 import io.github.oleksiifenin.raa.storage.ActionRecord;
+import io.github.oleksiifenin.raa.storage.ActionState;
 import io.github.oleksiifenin.raa.storage.CallRecord;
 import io.github.oleksiifenin.raa.storage.ClaimDecider;
 import io.github.oleksiifenin.raa.storage.ClaimRequest;
@@ -9,6 +10,7 @@ import io.github.oleksiifenin.raa.storage.ClaimResult;
 import io.github.oleksiifenin.raa.storage.FailureKind;
 import io.github.oleksiifenin.raa.storage.JournalException;
 import io.github.oleksiifenin.raa.storage.KeyAttempt;
+import io.github.oleksiifenin.raa.storage.ManualResolution;
 import io.github.oleksiifenin.raa.storage.RecordResult;
 import io.github.oleksiifenin.raa.storage.Resolution;
 import java.sql.SQLException;
@@ -32,6 +34,8 @@ final class FaultyJournal implements ActionJournal {
     final AtomicInteger recordCalls = new AtomicInteger();
     final AtomicBoolean failClaims = new AtomicBoolean();
     final AtomicBoolean failResolves = new AtomicBoolean();
+    final AtomicBoolean failDeletes = new AtomicBoolean();
+    final AtomicInteger deleteCalls = new AtomicInteger();
     final AtomicInteger renewCalls = new AtomicInteger();
     /** Record writes that fail without reaching the journal. */
     final AtomicInteger recordFailuresBeforeWrite = new AtomicInteger();
@@ -54,13 +58,13 @@ final class FaultyJournal implements ActionJournal {
     }
 
     @Override
-    public RecordResult recordSuccess(byte[] keyHash, int attempt, String resultText) {
-        return record(() -> delegate.recordSuccess(keyHash, attempt, resultText));
+    public RecordResult recordSuccess(KeyAttempt attempt, String resultText) {
+        return record(() -> delegate.recordSuccess(attempt, resultText));
     }
 
     @Override
-    public RecordResult recordFailure(byte[] keyHash, int attempt, FailureKind kind, String error) {
-        return record(() -> delegate.recordFailure(keyHash, attempt, kind, error));
+    public RecordResult recordFailure(KeyAttempt attempt, FailureKind kind, String error) {
+        return record(() -> delegate.recordFailure(attempt, kind, error));
     }
 
     private RecordResult record(Supplier<RecordResult> write) {
@@ -77,8 +81,8 @@ final class FaultyJournal implements ActionJournal {
     }
 
     @Override
-    public boolean markUnknownIfLeaseExpired(byte[] keyHash, int attempt, String reason) {
-        return delegate.markUnknownIfLeaseExpired(keyHash, attempt, reason);
+    public boolean markUnknownIfLeaseExpired(KeyAttempt attempt, String reason) {
+        return delegate.markUnknownIfLeaseExpired(attempt, reason);
     }
 
     @Override
@@ -93,11 +97,11 @@ final class FaultyJournal implements ActionJournal {
     }
 
     @Override
-    public boolean resolve(byte[] keyHash, int attempt, Resolution resolution) {
+    public boolean resolve(KeyAttempt attempt, Resolution resolution) {
         if (failResolves.get()) {
             throw storageDown();
         }
-        return delegate.resolve(keyHash, attempt, resolution);
+        return delegate.resolve(attempt, resolution);
     }
 
     @Override
@@ -111,5 +115,34 @@ final class FaultyJournal implements ActionJournal {
 
     private static JournalException storageDown() {
         return new JournalException("database unavailable", new SQLException("08001"));
+    }
+
+    @Override
+    public int deleteTerminalOlderThan(Duration retention, int batchSize) {
+        deleteCalls.incrementAndGet();
+        if (failDeletes.get()) {
+            throw storageDown();
+        }
+        return delegate.deleteTerminalOlderThan(retention, batchSize);
+    }
+
+    @Override
+    public List<ActionRecord> find(ActionState state, int limit) {
+        return delegate.find(state, limit);
+    }
+
+    @Override
+    public long count(ActionState state) {
+        return delegate.count(state);
+    }
+
+    @Override
+    public boolean resolveManually(KeyAttempt attempt, ManualResolution resolution) {
+        return delegate.resolveManually(attempt, resolution);
+    }
+
+    @Override
+    public boolean redact(byte[] keyHash) {
+        return delegate.redact(keyHash);
     }
 }

@@ -1,5 +1,6 @@
 package io.github.oleksiifenin.raa.core;
 
+import io.github.oleksiifenin.raa.storage.ActionAdmin;
 import io.github.oleksiifenin.raa.storage.ActionJournal;
 import java.time.Duration;
 import java.util.LinkedHashMap;
@@ -18,23 +19,26 @@ public final class ReliableActions {
     static final Duration DEFAULT_LEASE = Duration.ofSeconds(30);
     static final Duration DEFAULT_IN_PROGRESS_WAIT = Duration.ofSeconds(2);
     static final Duration DEFAULT_RECORD_RETRY_BUDGET = Duration.ofSeconds(3);
+    static final Duration DEFAULT_RETENTION = Duration.ofDays(7);
 
     private final Map<String, ActionPolicy> policies;
     private final LeaseRenewer leaseRenewer;
     private final ActionRunner runner;
     private final Reconciler reconciler;
     private final ActionTelemetry telemetry;
+    private final ActionAdmin admin;
 
     private ReliableActions(Builder builder) {
         String owner = UUID.randomUUID().toString(); // lease owner id of this wiring
         this.policies = Map.copyOf(builder.policies);
         this.telemetry = GuardedTelemetry.guard(builder.telemetry);
         ActionJournal journal = ObservedJournal.observe(builder.journal, telemetry);
+        this.admin = journal;
         this.leaseRenewer = new LeaseRenewer(journal, owner, builder.lease);
         this.runner = new ActionRunner(journal, Map.copyOf(builder.policies), owner, builder.lease,
                 builder.inProgressWait, builder.recordRetryBudget, leaseRenewer, builder.storeKeyText, telemetry);
         this.reconciler = new Reconciler(journal, Map.copyOf(builder.policies), Reconciler.DEFAULT_HOLD,
-                Reconciler.DEFAULT_BATCH_SIZE, telemetry);
+                Reconciler.DEFAULT_BATCH_SIZE, builder.retention, telemetry);
     }
 
     /**
@@ -87,6 +91,15 @@ public final class ReliableActions {
     }
 
     /**
+     * Returns the operator operations on the journal: find actions, resolve escalated ones, redact personal data.
+     *
+     * @return the journal's operator operations
+     */
+    public ActionAdmin admin() {
+        return admin;
+    }
+
+    /**
      * Returns the telemetry of this wiring, for framework adapters that report their own tool executions; failures of
      * the application's implementation are already caught and logged.
      *
@@ -106,6 +119,7 @@ public final class ReliableActions {
         private Duration recordRetryBudget = DEFAULT_RECORD_RETRY_BUDGET;
         private boolean storeKeyText;
         private ActionTelemetry telemetry = ActionTelemetry.none();
+        private Duration retention = DEFAULT_RETENTION;
 
         private Builder(ActionJournal journal) {
             this.journal = Objects.requireNonNull(journal, "journal");
@@ -188,18 +202,39 @@ public final class ReliableActions {
         }
 
         /**
+         * Sets how long finished actions ({@code SUCCEEDED}, {@code ABANDONED}) stay in the journal; default 7 days.
+         * Each {@link Reconciler#runOnce()} deletes one batch of older rows. A call with the key of a deleted action
+         * executes again, so the retention must exceed the longest time a conversation can be resumed; it must also
+         * exceed every tool's deadline. {@code UNKNOWN}, {@code ESCALATED}, {@code EXECUTING} and {@code FAILED} rows
+         * are never deleted automatically.
+         *
+         * @param retention positive duration
+         * @return this builder
+         */
+        public Builder retention(Duration retention) {
+            this.retention = requirePositive(retention, "retention");
+            return this;
+        }
+
+        /**
          * Validates every journaled policy and builds the wiring.
          *
          * @return the wiring
-         * @throws IllegalStateException if a policy breaks a wiring rule (see {@link JournaledPolicy#validate()})
+         * @throws IllegalStateException if a policy breaks a wiring rule (see {@link JournaledPolicy#validate()}) or
+         *                               the retention does not exceed a tool's deadline
          */
         public ReliableActions build() {
             policies.forEach((toolName, policy) -> {
                 if (policy instanceof JournaledPolicy<?>) {
+                    JournaledPolicy<?> journaled = (JournaledPolicy<?>) policy;
                     try {
-                        ((JournaledPolicy<?>) policy).validate();
+                        journaled.validate();
                     } catch (IllegalStateException e) {
                         throw new IllegalStateException("tool " + toolName + ": " + e.getMessage(), e);
+                    }
+                    if (retention.compareTo(journaled.deadline()) <= 0) {
+                        throw new IllegalStateException("tool " + toolName + ": the retention " + retention
+                                + " must exceed the deadline " + journaled.deadline());
                     }
                 }
             });

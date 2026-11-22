@@ -33,6 +33,8 @@ import java.util.Objects;
  * @param argumentsJson     raw arguments; {@code null} unless enabled (may contain personal data)
  * @param resultText        recorded result text; {@code null} unless an effect was recorded
  * @param lastError         last recorded error; may be {@code null}
+ * @param redactedAt        when {@link ActionAdmin#redact} erased the row's texts (database time); {@code null} if
+ *                          never. A redacted row stores no key text, arguments, result or error again
  */
 public record ActionRecord(
         byte[] keyHash,
@@ -56,7 +58,8 @@ public record ActionRecord(
         byte[] materialArgsHash,
         String argumentsJson,
         String resultText,
-        String lastError) {
+        String lastError,
+        Instant redactedAt) {
 
     /** Validates the mandatory columns and the state invariants the decision table relies on. */
     public ActionRecord {

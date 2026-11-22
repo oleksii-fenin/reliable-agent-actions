@@ -18,8 +18,16 @@ class StandardOutcomeRendererTest {
     @Test
     void resultsAreTheResultTextVerbatim() {
         assertThat(render(new ActionOutcome.Succeeded("refunded r-1", 1))).isEqualTo("refunded r-1");
-        assertThat(render(new ActionOutcome.Replayed("refunded r-1", Instant.EPOCH, false))).isEqualTo("refunded r-1");
-        assertThat(render(new ActionOutcome.Replayed("found r-1", Instant.EPOCH, true))).isEqualTo("found r-1");
+        assertThat(render(new ActionOutcome.Replayed("refunded r-1", Instant.EPOCH, false, false))).isEqualTo("refunded r-1");
+        assertThat(render(new ActionOutcome.Replayed("found r-1", Instant.EPOCH, true, false))).isEqualTo("found r-1");
+    }
+
+    @Test
+    void redactedResults_sayTheActionWasPerformed_withoutAResult() {
+        assertThat(render(new ActionOutcome.Replayed("", Instant.EPOCH, false, true))).isEqualTo("this action was"
+                + " already performed; its recorded result was removed from the journal; do not repeat");
+        assertThat(render(new ActionOutcome.Conflict(null, false))).isEqualTo("this action was already performed;"
+                + " its recorded result was removed from the journal; it was not performed again");
     }
 
     @Test

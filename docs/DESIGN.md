@@ -202,8 +202,10 @@ public interface ActionTelemetry {               // §10; every method has a no-
 public final class ActionRunner { public ActionOutcome run(ToolCall call, Effect effect); }
 public sealed interface ActionOutcome {
     record Succeeded(String resultText, int attempt) implements ActionOutcome {}
-    record Replayed(String resultText, Instant completedAt, boolean fromLookup) implements ActionOutcome {}
-    record Conflict(String recordedResultText /*nullable*/, boolean previousUnresolved) implements ActionOutcome {}
+    record Replayed(String resultText, Instant completedAt, boolean fromLookup, boolean resultRedacted)
+            implements ActionOutcome {}                    // resultRedacted: the result was erased by redact()
+    record Conflict(String recordedResultText /*nullable, also when redacted*/, boolean previousUnresolved)
+            implements ActionOutcome {}
     record InProgressElsewhere(Instant leaseUntil) implements ActionOutcome {}
     record Unknown(RepeatAdvice advice, String reason) implements ActionOutcome {}
     // RepeatAdvice: SAFE (IDEMPOTENT_DOWNSTREAM), MAY_DUPLICATE (AT_LEAST_ONCE), ASK_LATER (lookup pending)
@@ -221,28 +223,34 @@ public final class ActionContext {
 }
 public final class ActionRejectedException extends RuntimeException {}   // tool says: definitely not applied
 
-// ---- operator API
+// ---- operator API, module raa-storage-api; ActionJournal extends it, so every journal (and the TCK) covers it
 public interface ActionAdmin {
-    List<ActionRecord> find(ActionState state, int limit);
-    boolean resolveManually(byte[] keyHash, int attempt, ManualResolution resolution); // APPLIED(text) | NOT_APPLIED
-    int redact(byte[] keyHash);                // erase result/error/arguments (personal-data requests); keeps the dedup row
+    List<ActionRecord> find(ActionState state, int limit);   // least recently changed first
+    long count(ActionState state);                           // cheap for UNKNOWN/ESCALATED (partial index)
+    boolean resolveManually(KeyAttempt attempt, ManualResolution resolution); // Applied(text) | NotApplied;
+                                               // CAS on attempt and state ESCALATED
+    boolean redact(byte[] keyHash);            // erase key text, arguments, result, last error in any state and set
+                                               // redacted_at; the dedup row stays and no later write stores a text
 }
 
-// ---- SPI, module raa-storage-api (implemented by raa-postgres). All writes are compare-and-set on (key_hash, attempt) and run at READ COMMITTED.
+// ---- SPI, module raa-storage-api (implemented by raa-postgres). All writes after the claim are compare-and-set on the
+// fencing token KeyAttempt(keyHash, createdAt, attempt) — the row's creation time included (ADR-0007) — and run at
+// READ COMMITTED.
 public interface ActionJournal {
     ClaimResult claim(ClaimRequest request, ClaimDecider decider);  // FOR UPDATE + decider + apply, one transaction
-    RecordResult recordSuccess(byte[] keyHash, int attempt, String resultText);
+    RecordResult recordSuccess(KeyAttempt attempt, String resultText);
     //   APPLIED | SUPERSEDED (a newer attempt exists) | ALREADY_SUCCEEDED(row) (e.g. resolved earlier by lookup)
     //   | ALREADY_RESOLVED (failure only) | MISSING; carries the row and the state before the write
-    RecordResult recordFailure(byte[] keyHash, int attempt, FailureKind kind, String error);
-    boolean markUnknownIfLeaseExpired(byte[] keyHash, int attempt, String reason);
-    //   WHERE attempt = ? AND state = 'EXECUTING' AND lease_until < clock_timestamp(); sets resolve_after = clock_timestamp()
+    RecordResult recordFailure(KeyAttempt attempt, FailureKind kind, String error);
+    boolean markUnknownIfLeaseExpired(KeyAttempt attempt, String reason);
+    //   WHERE created_at = ? AND attempt = ? AND state = 'EXECUTING' AND lease_until < clock_timestamp();
+    //   sets resolve_after = clock_timestamp()
     int renewLeases(String owner, Collection<KeyAttempt> inFlight, Duration lease);      // per (key, attempt)
     List<ActionRecord> takeReconcileBatch(Duration hold, int limit);                      // short tx, SKIP LOCKED
-    boolean resolve(byte[] keyHash, int attempt, Resolution resolution);  // WHERE attempt = ? AND state = <source>
+    boolean resolve(KeyAttempt attempt, Resolution resolution);  // WHERE created_at, attempt match AND state = <source>
     //   Applied(text) | NotApplied | LookupUnreachable(backoff) | Escalate(reason): source UNKNOWN; Abandon(reason): FAILED
     Optional<CallRecord> findByProviderCallId(byte[] scopeHash, String providerCallId);   // via call history table
-    int deleteTerminalOlderThan(Duration retention, int batchSize);                      // week 7, with ActionAdmin
+    int deleteTerminalOlderThan(Duration retention, int batchSize);   // SUCCEEDED/ABANDONED, oldest first, SKIP LOCKED
 }
 
 // ---- raa-langchain4j
@@ -348,7 +356,9 @@ this tool again with the same arguments"; `Unknown(MAY_DUPLICATE)` → "outcome 
 twice — repeat only if a duplicate is acceptable"; `Unknown(ASK_LATER)` → "being verified; do not repeat now; call
 again after <time> to get the outcome"; `InProgressElsewhere` → "already in progress; do not repeat";
 `Escalated` → "could not be verified automatically; an operator has been notified; do not repeat";
-`Abandoned`/`Failed`/`JournalUnavailable` → "not performed: <reason>".
+`Abandoned`/`Failed`/`JournalUnavailable` → "not performed: <reason>"; a `Replayed` or `Conflict` of a succeeded action
+whose result was redacted → "this action was already performed; its recorded result was removed from the journal; do
+not repeat" (author, 2026-11-22); for such a conflict it ends "…; it was not performed again".
 
 **Reconciler** (`runOnce`, every 15 s, safe on many processes):
 1. `takeReconcileBatch`: one short transaction — `SELECT … FOR UPDATE SKIP LOCKED LIMIT n` of rows that are
@@ -368,9 +378,15 @@ again after <time> to get the outcome"; `InProgressElsewhere` → "already in pr
    `resolve_after - hold` of its rows (the take sets `resolve_after = clock_timestamp() + hold`). As in row 11, an
    `UNKNOWN` `AT_MOST_ONCE` row without a lookup is escalated at once; a lookup also waits for the lookup window after
    the deadline (an attempt that may still land is not declared "not found").
+6. Retention (author, 2026-11-22): after its batch every run deletes at most 1 000 `SUCCEEDED`/`ABANDONED` rows older
+   than `ReliableActions.Builder.retention` (default 7 days, must exceed every tool's deadline) with
+   `deleteTerminalOlderThan`; a failure of the delete is logged and the run returns normally. No separate job to
+   schedule. At the estimated 5 actions/s one run per 15 s deletes far more than arrives (1 000 per 15 s ≈ 66/s). A full
+   batch fits the operation timeout: 5 000 finished rows of 2 KB with call history, 8 days old, are deleted in five
+   batches in under a second locally (`PostgresRetentionTest`).
 
 **Lease renewer.** Every `lease/2`: `UPDATE raa_action SET lease_until = clock_timestamp() + :lease
-WHERE (key_hash, attempt) IN (:inFlight) AND state = 'EXECUTING' AND lease_owner = :owner
+WHERE (key_hash, created_at, attempt) IN (:inFlight) AND state = 'EXECUTING' AND lease_owner = :owner
 AND clock_timestamp() < started_at + max_effect_duration`. In-flight entries are registered at claim and removed in
 `finally`. Rows outside the predicate (moved to `UNKNOWN`, newer attempt, overrun) are not renewed; overrun effects
 therefore lose their lease and become `UNKNOWN` (R4) even though the thread cannot be killed.
@@ -421,8 +437,23 @@ must start attempt 1, inserted with `INSERT … ON CONFLICT (key_hash) DO NOTHIN
 inserted first (nothing returned) or the row was deleted in between, lock and decide again, at most 3 rounds. The
 call-id row is written in the same transaction: inserted if new (`ON CONFLICT DO NOTHING`), its attempt updated only
 when this call starts an attempt (so it always names the latest attempt *this* call started).
-Retention deletes `SUCCEEDED`/`ABANDONED` older than 7 days (default) in batches of 1 000; `ESCALATED`, `UNKNOWN`,
-`EXECUTING` are never deleted automatically.
+Retention deletes `SUCCEEDED`/`ABANDONED` older than 7 days (default) in batches of 1 000 from every reconciler run;
+`ESCALATED`, `UNKNOWN`, `EXECUTING` and `FAILED` are never deleted automatically. The delete locks its rows with
+`FOR UPDATE SKIP LOCKED` (a row held by a claim or a late write is left for the next run), so its time is never read
+before a lock wait; a claim waiting for a row the delete removes then sees no row and starts attempt 1. The call
+history goes with the row (`on delete cascade`). The next call with a deleted key creates a new row at attempt 1; a
+late write of the deleted row's attempts never lands on it, because every write compares the row's creation time
+(ADR-0007). Schema additions of week 7 (V1 is not published yet, so it changed in
+place): `redacted_at timestamptz` and `create index raa_action_unresolved on raa_action (updated_at) where state in
+('UNKNOWN','ESCALATED')` for `count`/`find` of unresolved rows.
+
+**Redaction** (author, 2026-11-22). `redact` erases `key_text`, `arguments_json`, `result_text`, `last_error` in any
+state and sets `redacted_at` once; `updated_at` is kept (retention and `completedAt` unchanged). Every later write
+stores `NULL` in those columns while `redacted_at` is set — a late result of a running attempt, a new attempt's key text
+and arguments, a lookup or manual result, an escalation reason — so a redaction cannot be undone by the attempt that was
+running. The row stays, so the key is still deduplicated; the model is told that the action was performed and that its
+result was removed. The hashes stay (key, scope, arguments; needed for deduplication and conflicts); for low-entropy
+values they are reversible by enumeration (§10). `redact` names the key, so it redacts the row the key has now.
 
 **Durability requirement.** The journal relies on committed rows surviving failover. With asynchronous replication a
 failover can lose a committed claim and the same key executes again — for every policy. Documented requirement:
@@ -663,8 +694,28 @@ server wrapper, strict mode, optional local-transaction mode (journal row and a 
   each, coverage checks green), hit every allowed end of every policy (both `AT_MOST_ONCE` escalations, the
   `RECONCILABLE` lookup, the `AT_LEAST_ONCE` duplicate, kills before the claim). A mutation that lets `AT_MOST_ONCE`
   retry an unknown attempt fails 5 of 25 runs (seed 11): 3 duplicates and 2 single effects after a committed claim, which
-  the first, looser oracle accepted. The
-  500-per-policy nightly runs only on CI (not yet run when this was written).
+  the first, looser oracle accepted. On CI the scheduled nightly ran 500 runs per policy green on 2026-11-20 (run
+  44716148009), 2026-11-21 (44891675973) and 2026-11-22 (45009427080); since 2026-11-21 (commit 1b86a7c) its build
+  matrix reruns every test instead of taking results from the build cache.
+* Verified since 2026-11-22 (week 7, stage A): retention, the operator API and redaction through `raa-journal-tck` on
+  PostgreSQL and the in-memory journal — only `SUCCEEDED`/`ABANDONED` past the retention are deleted, with their call
+  history; a deleted key executes again; the batch size; a row locked by a claim is skipped, not waited for; `find`
+  order and limit, `count`; manual resolution in both directions as a CAS on attempt and `ESCALATED`; redaction erases
+  every text, keeps the row and its update time, and no later write (late success, failure, new attempt, lease expiry,
+  lookup, escalation, manual result) stores a text. `PostgresTransactionTest`: a claim waiting for a row the retention
+  deletes decides without the row and starts attempt 1. Core: each reconciler run deletes rows past the retention and
+  survives a failing delete (`ReconcilerTest`); a retention not above a tool's deadline fails the wiring
+  (`ReliableActionsTest`); a redacted result is replayed as removed, also in inspect mode, and a conflict carries no
+  text (`ActionRunnerTest`, `StandardOutcomeRendererTest`). Mutations, each caught by the TCK on PostgreSQL: the delete
+  without `SKIP LOCKED`, a delete that includes `ESCALATED`, a late success that ignores the redaction, a manual
+  resolution without the state check (the first version of the retention test missed the `ESCALATED` mutation because
+  the unfinished rows were younger than the retention; it now waits for the youngest row). A write of a deleted row's
+  attempt never lands on the row created again for its key (record writes, lease renewal and expiry, resolutions,
+  manual resolution; ADR-0007); mutations dropping the creation-time comparison from the record writes or the lease
+  expiry fail. The redaction test is differential (the same writes on rows that are not redacted store their texts),
+  and a mutation letting an escalation store its reason on a redacted row fails it; the other redaction paths are not
+  mutation-tested one by one. A backlog of 5 000 finished rows is deleted in batches of 1 000 within the default
+  operation timeout (`PostgresRetentionTest`).
 * Not yet verified: Q3–Q5 and Q7 beyond the reference timing in the runner test; the `raa.actions.unresolved` gauge
   (week 7).
 * Desk research (not re-verified by the author): framework signatures and memory ordering
@@ -868,3 +919,24 @@ README gives settings that keep Q6 (HikariCP `connectionTimeout` 1 s, `validatio
 fault ends by disabling the proxy, which closes those connections. `DatabaseFaultTest` runs in
 every build (about 45 s), with a separate-thread test timeout because a read blocked on a dead socket ignores
 interrupts.
+
+Revision 17 (2026-11-22, roadmap week 7 stage A; author's decisions 2026-11-22: redaction marks the row and later
+writes store no text, retention runs in every reconciler run): `ActionAdmin` (`find`, `count`, `resolveManually`,
+`redact`) in `raa-storage-api`, extended by `ActionJournal` so every journal and the TCK cover it, reached through
+`ReliableActions.admin()`; `deleteTerminalOlderThan` on the SPI with `SKIP LOCKED`; `ReliableActions.Builder.retention`
+(7 days, above every deadline). Changes against §5 found while implementing: `redact` returns whether the row exists
+(not a row count) and works in every state, `count(state)` is added for the gauge, `ManualResolution.NotApplied`
+records a fixed last error so a later call is told who decided. The schema V1 changed in place (not published):
+`redacted_at` and a partial index on unresolved rows. `Replayed` gains `resultRedacted`; the renderer says that the
+result was removed instead of returning an empty text.
+Independent review (Codex, request changes), fixed the same day after the author chose a generation token: a write of
+a deleted row's attempt could land on the row the key got again, which also starts at attempt 1; every write after
+the claim now takes `KeyAttempt(keyHash, createdAt, attempt)` and compares the row's creation time (ADR-0007), and the
+TCK sends every kind of stale write after the row was created again. A mutation that drops the comparison from the
+record writes or from the lease expiry fails that test; the expiry check first waits for the new lease to expire, since
+a version that tried both tokens in one poll let the mutation pass when the lease expired between the two calls.
+Second independent review (Claude, approve with comments), fixed the same day: the redaction test asserted columns that
+were already empty, so it is now differential; a test shows that a full retention batch fits the operation timeout;
+the conflict on a redacted action says it was not performed again; a record write that finds no row is logged; the
+`Replayed` constructor without the redaction flag is gone; the Javadoc says that hashes stay after `redact` and that
+`redact` names the key.

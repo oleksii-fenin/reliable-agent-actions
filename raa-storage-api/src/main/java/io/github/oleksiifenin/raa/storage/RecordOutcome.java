@@ -13,6 +13,9 @@ public enum RecordOutcome {
      * resolved by a lookup or escalated); the row is unchanged.
      */
     ALREADY_RESOLVED,
-    /** There is no row for the key (for example deleted by retention). */
+    /**
+     * The row the attempt belongs to does not exist: there is no row for the key, or the row was created again after
+     * retention deleted the attempt's row (its creation time differs, {@link KeyAttempt}); nothing was changed.
+     */
     MISSING
 }

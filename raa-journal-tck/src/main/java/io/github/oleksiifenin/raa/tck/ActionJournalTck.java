@@ -19,6 +19,7 @@ import io.github.oleksiifenin.raa.storage.FailureBasis;
 import io.github.oleksiifenin.raa.storage.FailureKind;
 import io.github.oleksiifenin.raa.storage.JournalWrite;
 import io.github.oleksiifenin.raa.storage.KeyAttempt;
+import io.github.oleksiifenin.raa.storage.ManualResolution;
 import io.github.oleksiifenin.raa.storage.RecordOutcome;
 import io.github.oleksiifenin.raa.storage.RecordResult;
 import io.github.oleksiifenin.raa.storage.Resolution;
@@ -44,7 +45,9 @@ import org.junit.jupiter.api.Timeout;
  * class in its tests and supplies a journal on a running, empty-schema database; JUnit runs every inherited test.
  *
  * <p>Tests use real database time with short leases and wait by polling with a timeout, never by fixed sleeps. Keys
- * are random per test, so the database may be shared across tests and need not be emptied.
+ * are random per test, so the database may be shared across tests and need not be emptied. The retention tests delete
+ * every finished row older than a few hundred milliseconds, so the database must not be shared with tests that run at
+ * the same time and expect their finished rows to stay.
  */
 @Timeout(value = 60, unit = TimeUnit.SECONDS)
 public abstract class ActionJournalTck {
@@ -126,7 +129,7 @@ public abstract class ActionJournalTck {
     void claim_startsTheNextAttempt_replacingAttemptColumns_butKeepingTheDeadline() {
         byte[] key = newKey();
         ActionRecord first = journal().claim(request(key, null, LONG_LEASE), table()).record();
-        journal().recordFailure(key, 1, FailureKind.DEFINITE, "invalid amount");
+        journal().recordFailure(at(key, 1), FailureKind.DEFINITE, "invalid amount");
         ClaimRequest corrected = request(key, null, LONG_LEASE, hash(), hash());
 
         ClaimResult second = journal().claim(corrected, table());
@@ -167,7 +170,7 @@ public abstract class ActionJournalTck {
         byte[] abandonedKey = newKey();
         moveToUnknown(escalatedKey);
         journal().claim(request(abandonedKey, null, LONG_LEASE), table());
-        journal().recordFailure(abandonedKey, 1, FailureKind.DEFINITE, "no");
+        journal().recordFailure(at(abandonedKey, 1), FailureKind.DEFINITE, "no");
 
         ActionRecord escalated = journal().claim(request(escalatedKey, null, LONG_LEASE),
                 fixed(ClaimVerdict.ESCALATED, new JournalWrite.ChangeState(ActionState.ESCALATED))).record();
@@ -247,7 +250,7 @@ public abstract class ActionJournalTck {
         byte[] key = newKey();
         journal().claim(request(key, "call-1", LONG_LEASE), table());
         journal().claim(request(key, "call-2", LONG_LEASE), table()); // in progress: mapped to attempt 1
-        journal().recordFailure(key, 1, FailureKind.DEFINITE, "no");
+        journal().recordFailure(at(key, 1), FailureKind.DEFINITE, "no");
         journal().claim(request(key, "call-3", LONG_LEASE), table()); // starts attempt 2
 
         CallRecord first = journal().findByProviderCallId(scope(), "call-1").orElseThrow();
@@ -268,7 +271,7 @@ public abstract class ActionJournalTck {
     void claim_callHistory_updatesTheAttemptOnlyWhenTheSameCallStartsOne() {
         byte[] key = newKey();
         journal().claim(request(key, "call-1", LONG_LEASE), table());
-        journal().recordFailure(key, 1, FailureKind.DEFINITE, "no");
+        journal().recordFailure(at(key, 1), FailureKind.DEFINITE, "no");
 
         journal().claim(request(key, "call-1", LONG_LEASE), table());
 
@@ -279,7 +282,7 @@ public abstract class ActionJournalTck {
     void claim_callHistory_keepsTheAttemptACallStarted_whenTheSameCallLaterStartsNothing() {
         byte[] key = newKey();
         journal().claim(request(key, "call-1", LONG_LEASE), table());
-        journal().recordFailure(key, 1, FailureKind.DEFINITE, "no");
+        journal().recordFailure(at(key, 1), FailureKind.DEFINITE, "no");
         journal().claim(request(key, "call-2", LONG_LEASE), table()); // starts attempt 2
 
         ClaimResult again = journal().claim(request(key, "call-1", LONG_LEASE), table()); // attempt 2 is live
@@ -295,7 +298,7 @@ public abstract class ActionJournalTck {
         byte[] key = newKey();
         journal().claim(request(key, null, LONG_LEASE), table());
 
-        RecordResult result = journal().recordSuccess(key, 1, "refund 42 done");
+        RecordResult result = journal().recordSuccess(at(key, 1), "refund 42 done");
 
         assertThat(result.outcome()).isEqualTo(RecordOutcome.APPLIED);
         assertThat(result.stateBefore()).contains(ActionState.EXECUTING);
@@ -315,7 +318,7 @@ public abstract class ActionJournalTck {
             byte[] key = newKey();
             moveTo(key, state);
 
-            RecordResult result = journal().recordSuccess(key, 1, "late");
+            RecordResult result = journal().recordSuccess(at(key, 1), "late");
 
             assertThat(result.outcome()).as("from %s", state).isEqualTo(RecordOutcome.APPLIED);
             assertThat(result.stateBefore()).as("from %s", state).contains(state);
@@ -328,9 +331,9 @@ public abstract class ActionJournalTck {
     void recordSuccess_onASucceededAttempt_keepsTheFirstResult() {
         byte[] key = newKey();
         journal().claim(request(key, null, LONG_LEASE), table());
-        journal().recordSuccess(key, 1, "first");
+        journal().recordSuccess(at(key, 1), "first");
 
-        RecordResult result = journal().recordSuccess(key, 1, "second");
+        RecordResult result = journal().recordSuccess(at(key, 1), "second");
 
         assertThat(result.outcome()).isEqualTo(RecordOutcome.ALREADY_SUCCEEDED);
         assertThat(result.record().orElseThrow().resultText()).isEqualTo("first");
@@ -341,10 +344,10 @@ public abstract class ActionJournalTck {
     void recordSuccess_ofASupersededAttempt_isFenced() {
         byte[] key = newKey();
         journal().claim(request(key, null, LONG_LEASE), table());
-        journal().recordFailure(key, 1, FailureKind.DEFINITE, "no");
+        journal().recordFailure(at(key, 1), FailureKind.DEFINITE, "no");
         ActionRecord second = journal().claim(request(key, null, LONG_LEASE), table()).record();
 
-        RecordResult result = journal().recordSuccess(key, 1, "stale");
+        RecordResult result = journal().recordSuccess(at(key, 1), "stale");
 
         assertThat(result.outcome()).isEqualTo(RecordOutcome.SUPERSEDED);
         ActionRecord row = read(key);
@@ -356,8 +359,8 @@ public abstract class ActionJournalTck {
 
     @Test
     void recordWrites_withoutARow_reportMissing() {
-        assertThat(journal().recordSuccess(newKey(), 1, "x").outcome()).isEqualTo(RecordOutcome.MISSING);
-        assertThat(journal().recordFailure(newKey(), 1, FailureKind.DEFINITE, "x").outcome())
+        assertThat(journal().recordSuccess(absent(), "x").outcome()).isEqualTo(RecordOutcome.MISSING);
+        assertThat(journal().recordFailure(absent(), FailureKind.DEFINITE, "x").outcome())
                 .isEqualTo(RecordOutcome.MISSING);
     }
 
@@ -368,7 +371,7 @@ public abstract class ActionJournalTck {
         byte[] key = newKey();
         journal().claim(request(key, null, LONG_LEASE), table());
 
-        RecordResult result = journal().recordFailure(key, 1, FailureKind.DEFINITE, "invalid amount");
+        RecordResult result = journal().recordFailure(at(key, 1), FailureKind.DEFINITE, "invalid amount");
 
         assertThat(result.outcome()).isEqualTo(RecordOutcome.APPLIED);
         ActionRecord row = result.record().orElseThrow();
@@ -384,7 +387,7 @@ public abstract class ActionJournalTck {
         byte[] key = newKey();
         journal().claim(request(key, null, LONG_LEASE), table());
 
-        ActionRecord row = journal().recordFailure(key, 1, FailureKind.INDETERMINATE, "timeout").record()
+        ActionRecord row = journal().recordFailure(at(key, 1), FailureKind.INDETERMINATE, "timeout").record()
                 .orElseThrow();
 
         assertThat(row.state()).isEqualTo(ActionState.UNKNOWN);
@@ -397,7 +400,7 @@ public abstract class ActionJournalTck {
         byte[] key = newKey();
         moveToUnknown(key);
 
-        RecordResult result = journal().recordFailure(key, 1, FailureKind.DEFINITE, "rejected");
+        RecordResult result = journal().recordFailure(at(key, 1), FailureKind.DEFINITE, "rejected");
 
         assertThat(result.outcome()).isEqualTo(RecordOutcome.APPLIED);
         assertThat(result.stateBefore()).contains(ActionState.UNKNOWN);
@@ -411,14 +414,14 @@ public abstract class ActionJournalTck {
             moveTo(key, state);
             ActionRecord before = read(key);
 
-            RecordResult result = journal().recordFailure(key, 1, FailureKind.INDETERMINATE, "late");
+            RecordResult result = journal().recordFailure(at(key, 1), FailureKind.INDETERMINATE, "late");
 
             assertThat(result.outcome()).as("from %s", state).isEqualTo(RecordOutcome.ALREADY_RESOLVED);
             assertThat(read(key).updatedAt()).as("from %s", state).isEqualTo(before.updatedAt());
         }
         byte[] succeeded = newKey();
         moveTo(succeeded, ActionState.SUCCEEDED);
-        assertThat(journal().recordFailure(succeeded, 1, FailureKind.DEFINITE, "late").outcome())
+        assertThat(journal().recordFailure(at(succeeded, 1), FailureKind.DEFINITE, "late").outcome())
                 .isEqualTo(RecordOutcome.ALREADY_SUCCEEDED);
     }
 
@@ -426,10 +429,10 @@ public abstract class ActionJournalTck {
     void recordFailure_ofASupersededAttempt_isFenced() {
         byte[] key = newKey();
         journal().claim(request(key, null, LONG_LEASE), table());
-        journal().recordFailure(key, 1, FailureKind.DEFINITE, "no");
+        journal().recordFailure(at(key, 1), FailureKind.DEFINITE, "no");
         journal().claim(request(key, null, LONG_LEASE), table());
 
-        assertThat(journal().recordFailure(key, 1, FailureKind.INDETERMINATE, "stale").outcome())
+        assertThat(journal().recordFailure(at(key, 1), FailureKind.INDETERMINATE, "stale").outcome())
                 .isEqualTo(RecordOutcome.SUPERSEDED);
         assertThat(read(key).state()).isEqualTo(ActionState.EXECUTING);
     }
@@ -443,16 +446,16 @@ public abstract class ActionJournalTck {
         journal().claim(request(live, null, LONG_LEASE), table());
         journal().claim(request(expiring, null, SHORT_LEASE), table());
 
-        assertThat(journal().markUnknownIfLeaseExpired(live, 1, "lease expired")).isFalse();
-        assertThat(journal().markUnknownIfLeaseExpired(expiring, 2, "lease expired")).isFalse();
-        eventually(() -> journal().markUnknownIfLeaseExpired(expiring, 1, "lease expired"));
+        assertThat(journal().markUnknownIfLeaseExpired(at(live, 1), "lease expired")).isFalse();
+        assertThat(journal().markUnknownIfLeaseExpired(at(expiring, 2), "lease expired")).isFalse();
+        eventually(() -> journal().markUnknownIfLeaseExpired(at(expiring, 1), "lease expired"));
 
         ActionRecord row = read(expiring);
         assertThat(row.state()).isEqualTo(ActionState.UNKNOWN);
         assertThat(row.lastError()).isEqualTo("lease expired");
         assertThat(row.resolveAfter()).isEqualTo(row.updatedAt());
         assertThat(row.leaseUntil()).isNull();
-        assertThat(journal().markUnknownIfLeaseExpired(expiring, 1, "again")).isFalse();
+        assertThat(journal().markUnknownIfLeaseExpired(at(expiring, 1), "again")).isFalse();
         assertThat(read(live).state()).isEqualTo(ActionState.EXECUTING);
     }
 
@@ -467,8 +470,8 @@ public abstract class ActionJournalTck {
         journal().claim(request(otherOwner, null, SHORT_LEASE, "other-owner"), table());
         moveToUnknown(unknown);
 
-        int renewed = journal().renewLeases(OWNER, List.of(new KeyAttempt(own, 1), new KeyAttempt(own, 2),
-                new KeyAttempt(otherOwner, 1), new KeyAttempt(unknown, 1)), LONG_LEASE);
+        int renewed = journal().renewLeases(OWNER, List.of(at(own, 1), at(own, 2),
+                at(otherOwner, 1), at(unknown, 1)), LONG_LEASE);
 
         assertThat(renewed).isEqualTo(1);
         assertThat(read(own).leaseUntil()).isAfterOrEqualTo(before.leaseUntil().minus(SHORT_LEASE).plus(LONG_LEASE));
@@ -480,10 +483,10 @@ public abstract class ActionJournalTck {
     void renewLeases_ofASupersededAttempt_isFenced_evenForTheSameOwner() {
         byte[] key = newKey();
         journal().claim(request(key, null, LONG_LEASE), table());
-        journal().recordFailure(key, 1, FailureKind.DEFINITE, "no");
+        journal().recordFailure(at(key, 1), FailureKind.DEFINITE, "no");
         ActionRecord second = journal().claim(request(key, null, SHORT_LEASE), table()).record();
 
-        assertThat(journal().renewLeases(OWNER, List.of(new KeyAttempt(key, 1)), LONG_LEASE)).isZero();
+        assertThat(journal().renewLeases(OWNER, List.of(at(key, 1)), LONG_LEASE)).isZero();
         assertThat(read(key).leaseUntil()).isEqualTo(second.leaseUntil());
     }
 
@@ -494,7 +497,7 @@ public abstract class ActionJournalTck {
         journal().claim(request(first, null, SHORT_LEASE), table());
         journal().claim(request(second, null, SHORT_LEASE), table());
 
-        assertThat(journal().renewLeases(OWNER, List.of(new KeyAttempt(first, 1), new KeyAttempt(second, 1)),
+        assertThat(journal().renewLeases(OWNER, List.of(at(first, 1), at(second, 1)),
                 LONG_LEASE)).isEqualTo(2);
     }
 
@@ -505,8 +508,8 @@ public abstract class ActionJournalTck {
                 null, null, OWNER, SHORT_LEASE, Duration.ofMillis(300), Duration.ofMinutes(1));
         journal().claim(shortEffect, table());
 
-        eventually(() -> journal().renewLeases(OWNER, List.of(new KeyAttempt(key, 1)), SHORT_LEASE) == 0);
-        eventually(() -> journal().markUnknownIfLeaseExpired(key, 1, "overrun"));
+        eventually(() -> journal().renewLeases(OWNER, List.of(at(key, 1)), SHORT_LEASE) == 0);
+        eventually(() -> journal().markUnknownIfLeaseExpired(at(key, 1), "overrun"));
 
         assertThat(read(key).state()).isEqualTo(ActionState.UNKNOWN);
     }
@@ -525,7 +528,7 @@ public abstract class ActionJournalTck {
         moveToUnknown(unknown);
         journal().claim(new ClaimRequest(failedPastDeadline, scope(), null, "refund", "AT_LEAST_ONCE", hash(),
                 hash(), null, null, OWNER, LONG_LEASE, Duration.ofMillis(100), Duration.ofMillis(400)), table());
-        journal().recordFailure(failedPastDeadline, 1, FailureKind.DEFINITE, "no");
+        journal().recordFailure(at(failedPastDeadline, 1), FailureKind.DEFINITE, "no");
         journal().claim(request(live, null, LONG_LEASE), table());
         moveTo(failedBeforeDeadline, ActionState.FAILED);
         moveTo(succeeded, ActionState.SUCCEEDED);
@@ -610,7 +613,7 @@ public abstract class ActionJournalTck {
         byte[] key = newKey();
         moveToUnknown(key);
 
-        assertThat(journal().resolve(key, 1, new Resolution.Applied("found downstream"))).isTrue();
+        assertThat(journal().resolve(at(key, 1), new Resolution.Applied("found downstream"))).isTrue();
 
         ActionRecord row = read(key);
         assertThat(row.state()).isEqualTo(ActionState.SUCCEEDED);
@@ -623,7 +626,7 @@ public abstract class ActionJournalTck {
         byte[] key = newKey();
         moveToUnknown(key);
 
-        assertThat(journal().resolve(key, 1, new Resolution.NotApplied())).isTrue();
+        assertThat(journal().resolve(at(key, 1), new Resolution.NotApplied())).isTrue();
 
         ActionRecord row = read(key);
         assertThat(row.state()).isEqualTo(ActionState.FAILED);
@@ -637,8 +640,8 @@ public abstract class ActionJournalTck {
         moveToUnknown(key);
         Duration backoff = Duration.ofSeconds(30);
 
-        assertThat(journal().resolve(key, 1, new Resolution.LookupUnreachable(backoff))).isTrue();
-        assertThat(journal().resolve(key, 1, new Resolution.LookupUnreachable(backoff))).isTrue();
+        assertThat(journal().resolve(at(key, 1), new Resolution.LookupUnreachable(backoff))).isTrue();
+        assertThat(journal().resolve(at(key, 1), new Resolution.LookupUnreachable(backoff))).isTrue();
 
         ActionRecord row = read(key);
         assertThat(row.state()).isEqualTo(ActionState.UNKNOWN);
@@ -653,8 +656,8 @@ public abstract class ActionJournalTck {
         moveToUnknown(unknown);
         moveTo(failed, ActionState.FAILED);
 
-        assertThat(journal().resolve(unknown, 1, new Resolution.Escalate("8 lookups unreachable"))).isTrue();
-        assertThat(journal().resolve(failed, 1, new Resolution.Abandon("deadline passed"))).isTrue();
+        assertThat(journal().resolve(at(unknown, 1), new Resolution.Escalate("8 lookups unreachable"))).isTrue();
+        assertThat(journal().resolve(at(failed, 1), new Resolution.Abandon("deadline passed"))).isTrue();
 
         assertThat(read(unknown).state()).isEqualTo(ActionState.ESCALATED);
         assertThat(read(unknown).lastError()).isEqualTo("8 lookups unreachable");
@@ -668,16 +671,380 @@ public abstract class ActionJournalTck {
         byte[] key = newKey();
         journal().claim(request(key, null, LONG_LEASE), table());
 
-        assertThat(journal().resolve(key, 1, new Resolution.Applied("x"))).as("from EXECUTING").isFalse();
-        assertThat(journal().resolve(key, 1, new Resolution.Abandon("x"))).as("Abandon from EXECUTING").isFalse();
-        journal().recordFailure(key, 1, FailureKind.INDETERMINATE, "timeout");
-        assertThat(journal().resolve(key, 2, new Resolution.Applied("x"))).as("other attempt").isFalse();
-        assertThat(journal().resolve(key, 1, new Resolution.Abandon("x"))).as("Abandon from UNKNOWN").isFalse();
-        assertThat(journal().resolve(newKey(), 1, new Resolution.NotApplied())).as("no row").isFalse();
+        assertThat(journal().resolve(at(key, 1), new Resolution.Applied("x"))).as("from EXECUTING").isFalse();
+        assertThat(journal().resolve(at(key, 1), new Resolution.Abandon("x"))).as("Abandon from EXECUTING").isFalse();
+        journal().recordFailure(at(key, 1), FailureKind.INDETERMINATE, "timeout");
+        assertThat(journal().resolve(at(key, 2), new Resolution.Applied("x"))).as("other attempt").isFalse();
+        assertThat(journal().resolve(at(key, 1), new Resolution.Abandon("x"))).as("Abandon from UNKNOWN").isFalse();
+        assertThat(journal().resolve(absent(), new Resolution.NotApplied())).as("no row").isFalse();
         assertThat(read(key).state()).isEqualTo(ActionState.UNKNOWN);
     }
 
+
+    // ---- retention
+
+    @Test
+    void retention_deletesOnlyFinishedRowsOlderThanTheRetention_withTheirCallHistory() {
+        byte[] succeeded = newKey();
+        journal().claim(request(succeeded, "call-retained", LONG_LEASE), table());
+        journal().recordSuccess(at(succeeded, 1), "done");
+        byte[] abandoned = newKey();
+        moveTo(abandoned, ActionState.ABANDONED);
+        List<byte[]> kept = new ArrayList<>();
+        for (ActionState state : List.of(ActionState.EXECUTING, ActionState.FAILED, ActionState.UNKNOWN,
+                ActionState.ESCALATED)) {
+            byte[] key = newKey();
+            moveTo(key, state);
+            kept.add(key);
+        }
+        awaitAge(kept.get(kept.size() - 1), RETENTION); // the youngest row: every row is past the retention
+
+        journal().deleteTerminalOlderThan(Duration.ofHours(1), 1000);
+        assertThat(exists(succeeded)).as("a row younger than the retention").isTrue();
+        deleteAllOlderThan(RETENTION);
+
+        assertThat(exists(succeeded)).as("SUCCEEDED").isFalse();
+        assertThat(exists(abandoned)).as("ABANDONED").isFalse();
+        assertThat(journal().findByProviderCallId(scope(), "call-retained")).isEmpty();
+        for (byte[] key : kept) {
+            assertThat(exists(key)).as("unfinished rows are never deleted").isTrue();
+        }
+    }
+
+    @Test
+    void retention_aDeletedKeyExecutesAgain() {
+        byte[] key = newKey();
+        moveTo(key, ActionState.SUCCEEDED);
+        awaitAge(key, RETENTION);
+        deleteAllOlderThan(RETENTION);
+
+        ClaimResult again = journal().claim(request(key, null, LONG_LEASE), table());
+
+        assertThat(again.decision().verdict()).isEqualTo(ClaimVerdict.START);
+        assertThat(again.record().attempt()).isEqualTo(1);
+    }
+
+    @Test
+    void retention_writesOfTheDeletedRowsAttempts_neverLandOnTheRowCreatedAgain() {
+        byte[] key = newKey();
+        journal().claim(request(key, null, LONG_LEASE), table());
+        KeyAttempt old = at(key, 1);
+        journal().recordSuccess(old, "old result");
+        awaitAge(key, RETENTION);
+        deleteAllOlderThan(RETENTION);
+        ActionRecord recreated = journal().claim(request(key, null, SHORT_LEASE), table()).record();
+        assertThat(recreated.attempt()).as("the key starts again at attempt 1").isEqualTo(old.attempt());
+        assertThat(recreated.createdAt()).isNotEqualTo(old.createdAt());
+
+        // A writer of the deleted row (for example frozen for longer than the retention) wakes up.
+        assertThat(journal().recordSuccess(old, "old result").outcome()).isEqualTo(RecordOutcome.MISSING);
+        assertThat(journal().recordFailure(old, FailureKind.DEFINITE, "old error").outcome())
+                .isEqualTo(RecordOutcome.MISSING);
+        assertThat(journal().renewLeases(OWNER, List.of(old), LONG_LEASE)).isZero();
+        assertThat(read(key).leaseUntil()).isEqualTo(recreated.leaseUntil());
+        eventually(() -> databaseNow(key).isAfter(recreated.leaseUntil())); // the new lease has expired
+        assertThat(journal().markUnknownIfLeaseExpired(old, "old expiry")).isFalse();
+        assertThat(journal().markUnknownIfLeaseExpired(at(key, 1), "lease expired")).isTrue();
+        assertThat(journal().resolve(old, new Resolution.Escalate("old escalation"))).isFalse();
+        assertThat(journal().resolve(old, new Resolution.Applied("old lookup"))).isFalse();
+        journal().resolve(at(key, 1), new Resolution.Escalate("operator needed"));
+        assertThat(journal().resolveManually(old, new ManualResolution.Applied("old manual"))).isFalse();
+
+        ActionRecord row = read(key);
+        assertThat(row.state()).isEqualTo(ActionState.ESCALATED);
+        assertThat(row.resultText()).isNull();
+        assertThat(row.lastError()).isEqualTo("operator needed");
+        assertThat(journal().resolveManually(at(key, 1), new ManualResolution.Applied("new result"))).isTrue();
+        assertThat(read(key).resultText()).isEqualTo("new result");
+    }
+
+    @Test
+    void retention_respectsTheBatchSize_andRejectsInvalidArguments() {
+        for (int i = 0; i < 3; i++) {
+            moveTo(newKey(), ActionState.SUCCEEDED);
+        }
+        byte[] last = newKey();
+        moveTo(last, ActionState.SUCCEEDED);
+        awaitAge(last, RETENTION);
+
+        assertThat(journal().deleteTerminalOlderThan(RETENTION, 1)).isEqualTo(1);
+        assertThatThrownBy(() -> journal().deleteTerminalOlderThan(RETENTION, 0))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> journal().deleteTerminalOlderThan(Duration.ZERO, 1))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void retention_skipsARowLockedByAClaim_insteadOfWaiting() throws Exception {
+        byte[] locked = newKey();
+        moveTo(locked, ActionState.SUCCEEDED);
+        awaitAge(locked, RETENTION);
+        CountDownLatch lockHeld = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        CompletableFuture<ClaimResult> holder = runAsync(() -> journal().claim(request(locked, null, LONG_LEASE),
+                (request, row, now) -> {
+                    lockHeld.countDown();
+                    await(release);
+                    return new ClaimDecision(ClaimVerdict.REPLAY, new JournalWrite.None());
+                }));
+        try {
+            await(lockHeld);
+            CompletableFuture<Void> deleting = runAsync(() -> {
+                deleteAllOlderThan(RETENTION);
+                return null;
+            });
+
+            deleting.get(20, TimeUnit.SECONDS); // returns although the row stays locked
+        } finally {
+            release.countDown();
+            holder.get(30, TimeUnit.SECONDS);
+        }
+        assertThat(exists(locked)).as("a row locked by a running claim was deleted").isTrue();
+        deleteAllOlderThan(RETENTION);
+        assertThat(exists(locked)).as("deleted once the claim committed").isFalse();
+    }
+
+    // ---- operator operations
+
+    @Test
+    void find_listsOneState_leastRecentlyChangedFirst_upToTheLimit() {
+        byte[] first = newKey();
+        byte[] second = newKey();
+        moveTo(first, ActionState.ESCALATED);
+        moveTo(second, ActionState.ESCALATED);
+        moveTo(newKey(), ActionState.UNKNOWN);
+
+        List<ActionRecord> escalated = journal().find(ActionState.ESCALATED, 100_000);
+
+        assertThat(escalated).allSatisfy(row -> assertThat(row.state()).isEqualTo(ActionState.ESCALATED));
+        assertThat(escalated).extracting(ActionRecord::updatedAt).isSorted();
+        List<byte[]> keys = escalated.stream().map(ActionRecord::keyHash).toList();
+        assertThat(indexOf(keys, first)).isNotNegative().isLessThan(indexOf(keys, second));
+        assertThat(journal().find(ActionState.ESCALATED, 1)).hasSize(1);
+        assertThatThrownBy(() -> journal().find(ActionState.ESCALATED, 0))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void count_countsTheRowsInAState() {
+        long unknownBefore = journal().count(ActionState.UNKNOWN);
+        long escalatedBefore = journal().count(ActionState.ESCALATED);
+        moveTo(newKey(), ActionState.UNKNOWN);
+        moveTo(newKey(), ActionState.ESCALATED);
+        moveTo(newKey(), ActionState.ESCALATED);
+
+        assertThat(journal().count(ActionState.UNKNOWN)).isEqualTo(unknownBefore + 1);
+        assertThat(journal().count(ActionState.ESCALATED)).isEqualTo(escalatedBefore + 2);
+    }
+
+    @Test
+    void resolveManually_applied_movesAnEscalatedActionToSucceeded_andLaterCallsReplayIt() {
+        byte[] key = newKey();
+        moveTo(key, ActionState.ESCALATED);
+
+        assertThat(journal().resolveManually(at(key, 1), new ManualResolution.Applied("refund r-7 found"))).isTrue();
+
+        ActionRecord row = read(key);
+        assertThat(row.state()).isEqualTo(ActionState.SUCCEEDED);
+        assertThat(row.resultText()).isEqualTo("refund r-7 found");
+        assertThat(row.resolveAfter()).isNull();
+        assertThat(journal().claim(request(key, null, LONG_LEASE), table()).decision().verdict())
+                .isEqualTo(ClaimVerdict.REPLAY);
+    }
+
+    @Test
+    void resolveManually_notApplied_movesAnEscalatedActionToAbandoned() {
+        byte[] key = newKey();
+        moveTo(key, ActionState.ESCALATED);
+
+        assertThat(journal().resolveManually(at(key, 1), new ManualResolution.NotApplied())).isTrue();
+
+        ActionRecord row = read(key);
+        assertThat(row.state()).isEqualTo(ActionState.ABANDONED);
+        assertThat(row.lastError()).isEqualTo(ManualResolution.NOT_APPLIED_ERROR);
+        assertThat(row.resolveAfter()).isNull();
+    }
+
+    @Test
+    void resolveManually_isACompareAndSetOnAttemptAndTheEscalatedState() {
+        byte[] escalated = newKey();
+        moveTo(escalated, ActionState.ESCALATED);
+        byte[] unknown = newKey();
+        moveTo(unknown, ActionState.UNKNOWN);
+        ManualResolution applied = new ManualResolution.Applied("x");
+
+        assertThat(journal().resolveManually(at(escalated, 2), applied)).as("other attempt").isFalse();
+        assertThat(journal().resolveManually(at(unknown, 1), applied)).as("from UNKNOWN").isFalse();
+        assertThat(journal().resolveManually(absent(), applied)).as("no row").isFalse();
+        assertThat(journal().resolveManually(at(escalated, 1), new ManualResolution.NotApplied())).isTrue();
+        assertThat(journal().resolveManually(at(escalated, 1), applied)).as("already resolved").isFalse();
+        assertThat(read(escalated).state()).isEqualTo(ActionState.ABANDONED);
+        assertThat(read(unknown).state()).isEqualTo(ActionState.UNKNOWN);
+    }
+
+    @Test
+    void redact_erasesEveryText_keepsTheRowAndItsUpdateTime() {
+        byte[] key = newKey();
+        journal().claim(requestWithTexts(key, LONG_LEASE), table());
+        ActionRecord succeeded = journal().recordSuccess(at(key, 1), "refunded order-42").record().orElseThrow();
+        assertThat(succeeded.keyText()).isNotNull();
+        assertThat(succeeded.argumentsJson()).isNotNull();
+
+        assertThat(journal().redact(key)).isTrue();
+
+        ActionRecord row = read(key);
+        assertThat(row.state()).isEqualTo(ActionState.SUCCEEDED);
+        assertThat(row.keyText()).isNull();
+        assertThat(row.argumentsJson()).isNull();
+        assertThat(row.resultText()).isNull();
+        assertThat(row.lastError()).isNull();
+        assertThat(row.redactedAt()).isNotNull().isAfterOrEqualTo(succeeded.updatedAt());
+        assertThat(row.updatedAt()).isEqualTo(succeeded.updatedAt());
+        assertThat(journal().claim(request(key, null, LONG_LEASE), table()).decision().verdict())
+                .as("the key is still deduplicated").isEqualTo(ClaimVerdict.REPLAY);
+        assertThat(journal().redact(key)).as("again").isTrue();
+        assertThat(read(key).redactedAt()).isEqualTo(row.redactedAt());
+        assertThat(journal().redact(newKey())).as("no row").isFalse();
+    }
+
+    @Test
+    void redact_laterWritesToTheRowStoreNoText() {
+        // The same writes on rows that are not redacted store their texts; so each null below comes from the redaction.
+        List<Observed> plain = writeEveryText(false);
+        List<Observed> redacted = writeEveryText(true);
+
+        assertThat(plain).allSatisfy(write -> assertThat(write.text()).as(write.label()).isNotNull());
+        assertThat(redacted).allSatisfy(write -> assertThat(write.text()).as(write.label()).isNull());
+        assertThat(redacted).extracting(Observed::state).as("every write landed")
+                .containsExactlyElementsOf(plain.stream().map(Observed::state).toList());
+    }
+
+    /** One write and the row after it: its state and the text column the write sets. */
+    private record Observed(String label, ActionState state, String text) {}
+
+    /** Every write that stores a text, each on a row redacted before it when {@code redact} is set. */
+    private List<Observed> writeEveryText(boolean redact) {
+        List<Observed> observed = new ArrayList<>();
+        byte[] running = newKey();
+        journal().claim(requestWithTexts(running, LONG_LEASE), table());
+        redactIf(redact, running);
+        journal().recordSuccess(at(running, 1), "refunded order-42");
+        observed.add(new Observed("late success", read(running).state(), read(running).resultText()));
+
+        byte[] retried = newKey();
+        journal().claim(requestWithTexts(retried, LONG_LEASE), table());
+        redactIf(redact, retried);
+        journal().recordFailure(at(retried, 1), FailureKind.DEFINITE, "order-42 is locked");
+        observed.add(new Observed("definite failure", read(retried).state(), read(retried).lastError()));
+        ActionRecord second = journal().claim(requestWithTexts(retried, LONG_LEASE), table()).record();
+        observed.add(new Observed("key text of attempt " + second.attempt(), second.state(), second.keyText()));
+        observed.add(new Observed("arguments of attempt " + second.attempt(), second.state(),
+                second.argumentsJson()));
+        journal().recordFailure(at(retried, 2), FailureKind.INDETERMINATE, "timeout for order-42");
+        observed.add(new Observed("indeterminate failure", read(retried).state(), read(retried).lastError()));
+        journal().resolve(at(retried, 2), new Resolution.Escalate("order-42 unverifiable"));
+        observed.add(new Observed("escalation", read(retried).state(), read(retried).lastError()));
+        journal().resolveManually(at(retried, 2), new ManualResolution.Applied("refund of order-42"));
+        observed.add(new Observed("manual resolution", read(retried).state(), read(retried).resultText()));
+
+        byte[] expired = newKey();
+        journal().claim(requestWithTexts(expired, SHORT_LEASE), table());
+        redactIf(redact, expired);
+        eventually(() -> journal().markUnknownIfLeaseExpired(at(expired, 1), "lease of order-42 expired"));
+        observed.add(new Observed("lease expiry", read(expired).state(), read(expired).lastError()));
+        journal().resolve(at(expired, 1), new Resolution.Applied("found order-42"));
+        observed.add(new Observed("lookup", read(expired).state(), read(expired).resultText()));
+        return observed;
+    }
+
+    private void redactIf(boolean redact, byte[] key) {
+        if (redact) {
+            assertThat(journal().redact(key)).isTrue();
+        }
+    }
+
     // ---- helpers
+
+    /** Age the retention tests wait for; every finished row older than that is deleted by them. */
+    private static final Duration RETENTION = Duration.ofMillis(300);
+
+    /** Whether the row exists, by a claim whose decider fails (and so rolls back) when there is none. */
+    private boolean exists(byte[] key) {
+        try {
+            journal().claim(request(key, null, LONG_LEASE), (request, row, now) -> {
+                if (row.isEmpty()) {
+                    throw new NoRow();
+                }
+                return new ClaimDecision(ClaimVerdict.IN_PROGRESS, new JournalWrite.None());
+            });
+            return true;
+        } catch (NoRow expected) {
+            return false;
+        }
+    }
+
+    /** Thrown by the decider of {@link #exists} for a missing row. */
+    private static final class NoRow extends RuntimeException {
+        private static final long serialVersionUID = 1L;
+    }
+
+    /**
+     * Attempt {@code attempt} of the row of {@code key} as it exists now: the fencing token a writer of that attempt
+     * holds.
+     *
+     * @param key     an existing row
+     * @param attempt the attempt number
+     * @return the token
+     */
+    protected final KeyAttempt at(byte[] key, int attempt) {
+        return new KeyAttempt(key, read(key).createdAt(), attempt);
+    }
+
+    /** A token for a key that has no row. */
+    private static KeyAttempt absent() {
+        return new KeyAttempt(newKey(), Instant.EPOCH, 1);
+    }
+
+    /** Waits until the database time is more than {@code age} past the row's last change. */
+    private void awaitAge(byte[] key, Duration age) {
+        Instant changed = read(key).updatedAt();
+        eventually(() -> databaseNow(key).isAfter(changed.plus(age)));
+    }
+
+    private Instant databaseNow(byte[] key) {
+        Instant[] seen = new Instant[1];
+        journal().claim(request(key, null, LONG_LEASE), (request, row, now) -> {
+            seen[0] = now;
+            return new ClaimDecision(ClaimVerdict.IN_PROGRESS, new JournalWrite.None());
+        });
+        return seen[0];
+    }
+
+    /** Deletes batches until none is full, so every unlocked finished row older than {@code retention} is gone. */
+    private void deleteAllOlderThan(Duration retention) {
+        int batch = 1000;
+        long deadline = System.nanoTime() + POLL_TIMEOUT.toNanos();
+        while (journal().deleteTerminalOlderThan(retention, batch) == batch) {
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError("retention did not finish within " + POLL_TIMEOUT);
+            }
+        }
+    }
+
+    private static int indexOf(List<byte[]> keys, byte[] key) {
+        for (int i = 0; i < keys.size(); i++) {
+            if (Arrays.equals(keys.get(i), key)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /** A claim request that stores key text and arguments, which may contain personal data. */
+    private ClaimRequest requestWithTexts(byte[] key, Duration lease) {
+        return new ClaimRequest(key, scope(), "tck:refund:order-42", "refund", "AT_LEAST_ONCE", MATERIAL, ALL_ARGS,
+                "{\"orderId\":\"order-42\"}", null, OWNER, lease, Duration.ofMinutes(1), Duration.ofMinutes(10));
+    }
 
     /** Reads the row through a claim that writes nothing. */
     protected final ActionRecord read(byte[] key) {
@@ -696,21 +1063,21 @@ public abstract class ActionJournalTck {
             case EXECUTING:
                 return;
             case SUCCEEDED:
-                journal().recordSuccess(key, 1, "done");
+                journal().recordSuccess(at(key, 1), "done");
                 return;
             case FAILED:
-                journal().recordFailure(key, 1, FailureKind.DEFINITE, "no");
+                journal().recordFailure(at(key, 1), FailureKind.DEFINITE, "no");
                 return;
             case UNKNOWN:
-                journal().recordFailure(key, 1, FailureKind.INDETERMINATE, "timeout");
+                journal().recordFailure(at(key, 1), FailureKind.INDETERMINATE, "timeout");
                 return;
             case ESCALATED:
-                journal().recordFailure(key, 1, FailureKind.INDETERMINATE, "timeout");
-                journal().resolve(key, 1, new Resolution.Escalate("operator needed"));
+                journal().recordFailure(at(key, 1), FailureKind.INDETERMINATE, "timeout");
+                journal().resolve(at(key, 1), new Resolution.Escalate("operator needed"));
                 return;
             case ABANDONED:
-                journal().recordFailure(key, 1, FailureKind.DEFINITE, "no");
-                journal().resolve(key, 1, new Resolution.Abandon("deadline"));
+                journal().recordFailure(at(key, 1), FailureKind.DEFINITE, "no");
+                journal().resolve(at(key, 1), new Resolution.Abandon("deadline"));
                 return;
             default:
                 throw new IllegalArgumentException(state.name());

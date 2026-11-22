@@ -24,6 +24,7 @@ create table raa_action (
     arguments_json      jsonb,                        -- opt-in only (personal data)
     result_text         text,                         -- needed for replay; personal data -> retention, redact()
     last_error          text,
+    redacted_at         timestamptz,                  -- set by redact(): texts erased, none stored again
     check (state <> 'FAILED' or failure_basis is not null)
 );
 
@@ -40,3 +41,4 @@ create index raa_action_call_key      on raa_action_call (key_hash);
 create index raa_action_expired_lease on raa_action (lease_until)   where state = 'EXECUTING';
 create index raa_action_resolve       on raa_action (resolve_after nulls first) where state in ('UNKNOWN','FAILED');
 create index raa_action_terminal      on raa_action (updated_at)    where state in ('SUCCEEDED','ABANDONED');
+create index raa_action_unresolved    on raa_action (updated_at)    where state in ('UNKNOWN','ESCALATED');
