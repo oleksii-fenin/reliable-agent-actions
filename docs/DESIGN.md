@@ -523,7 +523,7 @@ otherwise the guarantee is reduced to "per failover epoch".
 | OTel | `InMemorySpanExporter` / `InMemoryMetricReader`: one span per action with key hash, policy, attempt, outcome | R8 |
 | Clock | child JVM under libfaketime shifted ±1 h; decisions unchanged | DB-time rule |
 | Wiring | tool without policy, `IMMEDIATE` tool, `maxEffectDuration ≥ deadline`, deadline > dedup window → rejected at build time | R5 |
-| Overhead (Q3) | timed loop of 10 000 actions against local PostgreSQL; p50/p99 in README, not a gate | Q3 |
+| Overhead (Q3, Q5) | timed loop of 10 000 actions against local PostgreSQL, sequential and on 8 threads (`OverheadBenchmarkTest`, off unless `-PoverheadActions`); p50/p99 and throughput in README, not a gate | Q3, Q5 |
 
 ### 9.1 Expected outcomes of the kill matrix
 
@@ -742,7 +742,14 @@ server wrapper, strict mode, optional local-transaction mode (journal row and a 
   failure not caught, the guard letting the gauge's exception through, the OpenTelemetry states swapped, `count` or
   `find` with the state as a parameter again. Not tested: a run interrupted before the count skips it, like the
   retention delete.
-* Not yet verified: Q3–Q5 and Q7 beyond the reference timing in the runner test.
+* Measured on 2026-11-22 (week 7, stage C), not a gate: Q3 and Q5 with `OverheadBenchmarkTest` (10 000 actions per
+  phase after 1 000 warm-up each, HikariCP pool 10, PostgreSQL 18.6 in rootless Docker on the author's laptop,
+  i7-8750H, `fsync=on`), three runs. One thread: p50 5.1 ms, p99 8.2–8.3 ms (Q3 target p99 < 10 ms met, with little
+  margin). Eight threads in a closed loop: 1 300–1 320 actions/s (Q5 target 200/s), p99 12.0–13.8 ms at saturation.
+  Floors on the same pool: a `select 1` transaction p50 0.32 ms, a one-row insert transaction p50 1.5 ms; two
+  transactions of that shape are about 60 % of the median, the rest is not broken down. The test asserts only that
+  every action succeeded once; the nearest-rank percentile has its own test (`OverheadPercentileTest`).
+* Not yet verified: Q4 (recovery timing) and Q7 (scheduled check against the latest LangChain4j).
 * Desk research (not re-verified by the author): framework signatures and memory ordering
   (`docs/research/framework-integration-surface.md`), competitor behavior (`docs/research/*.md`).
 * Argued: every guarantee in §1/§2 until the §9 tests exist and pass.
@@ -977,3 +984,14 @@ starts with `raa_action_`, the primary key included, so it now names the partial
 asserted a sequential scan, which a scan of the primary key also avoids, so it now asserts that no partial index is
 used; a test ties the checked SQL to what the journal sends; the staleness of the gauge during an outage is documented
 and the cross-process claims are labelled argued.
+
+Revision 19 (2026-11-22, roadmap week 7 stage C): Q3 and Q5 measured by `OverheadBenchmarkTest` in `raa-postgres`
+(off unless `-PoverheadActions=<n>`, like the randomized kill): a first call with an effect that does nothing, so its
+duration is the added latency, sequentially (Q3) and on 8 threads (Q5), with two floors on the same pool (a `select 1`
+and a one-row insert transaction) that show where the time goes. Not a gate: the numbers depend on the machine and are
+recorded in README and §13 with the environment; the test fails only if an action does not succeed exactly once.
+Independent review (Claude, approve with comments; Codex was at its usage limit), fixed the same day: the floor is a
+whole insert transaction, not an isolated commit, so the text says "two transactions of the floor's shape" and leaves
+the rest unattributed; the documented command adds `--rerun` (a second run with the same property was up to date);
+the 8-thread phase is labelled a closed loop at saturation and gets its own warm-up; the percentile uses integer
+arithmetic and has a test. The numbers above come from three runs of the final version.

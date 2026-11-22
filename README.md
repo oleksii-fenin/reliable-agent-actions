@@ -102,7 +102,25 @@ tool call**, one that **pauses** it past its lease, and negative controls provin
   arguments, result and error of an action (for example on a personal-data request) while the key stays deduplicated,
   and nothing written to that action later stores a text again. The model is then told that the action was performed
   and its result removed.
-* **Argued, not verified yet:** failover behavior, overhead.
+* **Measured — overhead and throughput** (`OverheadBenchmarkTest`, off by default; run it alone with
+  `./gradlew :raa-postgres:test --tests '*OverheadBenchmarkTest*' -PoverheadActions=10000 --rerun`): a journaled first
+  call whose effect does nothing, so its time is the added latency, on HikariCP (pool 10, the settings below) against
+  PostgreSQL 18.6 in rootless Docker on the same laptop (Intel i7-8750H, 12 logical CPUs, Linux 6.8, Java 25,
+  `synchronous_commit=on`, `fsync=on`; rootless Docker forwards the port in user space, which every round trip pays),
+  10 000 measured actions per phase after 1 000 warm-up each, three runs on 2026-11-22:
+
+  | | p50 | p99 | throughput |
+  |---|---|---|---|
+  | one thread (Q3, target p99 < 10 ms) | 5.1 ms | 8.2–8.3 ms | — |
+  | 8 threads, closed loop at saturation (Q5, target ≥ 200/s) | 5.8–6.1 ms | 12.0–13.8 ms | 1 300–1 320 actions/s |
+  | floor: a pooled one-row insert transaction | 1.5 ms | 2.1–2.2 ms | — |
+
+  Two transactions of the floor's shape (claim and record each end in a durable commit) are about 60 % of the
+  median; the rest is not broken down (the journal's transaction setup, the claim's reads and call history, wider
+  rows and more indexes, the runtime). In the 8-thread phase each thread starts its next call when the previous one
+  returns, so its latencies are those of a saturated pool, not of a given offered load. The numbers belong to this
+  machine; a database across a network adds its round-trip time to every statement. A measurement, not a gate.
+* **Argued, not verified yet:** failover behavior.
 
 ## Quick start (API as implemented, not released)
 

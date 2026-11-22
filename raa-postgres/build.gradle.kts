@@ -26,7 +26,10 @@ val randomizedKill = mapOf(
     "raa.randomizedKill.seed" to providers.gradleProperty("randomizedKillSeed"),
     "raa.randomizedKill.maxDelayMillis" to providers.gradleProperty("randomizedKillMaxDelayMillis"),
 )
+// The overhead measurement (OverheadBenchmarkTest, Q3/Q5) runs only when overheadActions is set.
+val overheadActions = providers.gradleProperty("overheadActions")
 tasks.withType<Test>().configureEach {
     systemProperty("raa.postgres.image", postgresImage.get())
     randomizedKill.forEach { (name, value) -> value.orNull?.let { systemProperty(name, it) } }
+    overheadActions.orNull?.let { systemProperty("raa.overhead.actions", it) }
 }
