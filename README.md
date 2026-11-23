@@ -1,9 +1,10 @@
 # reliable-agent-actions
 
-> **Status: implementation in progress, not released** (design approved 2026-11-09). Core, PostgreSQL journal,
-> reconciler, the LangChain4j adapter with chat-memory repair (tested on 1.14.0 and 1.23.0), the process-kill test
-> through LangChain4j, the process-pause test, the database fault tests and OpenTelemetry spans and metrics exist. See the verification status below the guarantees and `examples/langchain4j-refund`.
-> Working name — see [`docs/OPEN-QUESTIONS.md`](docs/OPEN-QUESTIONS.md).
+> **Status: 0.1.0 complete, not published yet.** Core, the PostgreSQL journal, the reconciler with retention, the
+> operator API, the LangChain4j adapter with chat-memory repair (tested on 1.14.0 and 1.23.0), OpenTelemetry spans
+> and metrics, and the kill, pause and database-fault tests exist; the 0.1.0 artifacts build locally. Maven Central
+> publication waits for the signing key and the author's go-ahead. See the verification status below the guarantees
+> and `examples/langchain4j-refund`. Working name — see [`docs/OPEN-QUESTIONS.md`](docs/OPEN-QUESTIONS.md).
 
 A small Java library that makes **side-effecting tool calls of AI agents effectively-once**. Your agent's
 "refund the order", "send the e-mail", "create the ticket" takes effect **once per logical action** — when the external
@@ -46,10 +47,19 @@ meaning, and an explicit rule for what to do when the outcome is unknown.
 | | Automatic completion without the agent: the library never re-runs a tool by itself; an unknown outcome nobody asks about again is escalated at its deadline |
 | | Unattended lookups without key text: the reconciler can look up only actions whose key is stored as text (`storeKeyText(true)`, which puts business identifiers such as order ids into the journal); otherwise the next call looks the outcome up, or it is escalated at its deadline ([ADR-0004](docs/adr/0004-reconciler-lookups-need-the-action-key.md)) |
 
-Every row on the left is to be backed by an automated test, including a test that **kills the JVM in the middle of a
-tool call**, one that **pauses** it past its lease, and negative controls proving the harness detects duplicates.
+Every row on the left is backed by automated tests, including a test that **kills the JVM in the middle of a tool
+call**, one that **pauses** it past its lease, and negative controls proving the harness detects duplicates:
 
-**Verification status (2026-11-19, PostgreSQL 14 and 18):**
+| Guarantee | Tests |
+|---|---|
+| One live lease per key; only the current attempt changes the journal, also after retention reused the key | [`ActionJournalTck`](raa-journal-tck/src/main/java/io/github/oleksiifenin/raa/tck/ActionJournalTck.java) (claim locking, fenced record writes, lease renewal and expiry, a re-created row), [`ConcurrentClaimTest`](raa-postgres/src/test/java/io/github/oleksiifenin/raa/postgres/ConcurrentClaimTest.java), [`TwoJvmConcurrencyTest`](raa-postgres/src/test/java/io/github/oleksiifenin/raa/postgres/TwoJvmConcurrencyTest.java), [`PauseTest`](raa-postgres/src/test/java/io/github/oleksiifenin/raa/postgres/PauseTest.java) |
+| A succeeded action is never re-executed; the recorded result on repeat; a conflict on changed material arguments | [`ActionRunnerTest`](raa-core/src/test/java/io/github/oleksiifenin/raa/core/ActionRunnerTest.java), [`DecisionTableTest`](raa-core/src/test/java/io/github/oleksiifenin/raa/core/DecisionTableTest.java), [`KillMatrixTest`](raa-postgres/src/test/java/io/github/oleksiifenin/raa/postgres/KillMatrixTest.java), [`LangChain4jContractTest`](raa-langchain4j/src/test/java/io/github/oleksiifenin/raa/langchain4j/LangChain4jContractTest.java) |
+| An unknown outcome is never retried silently | [`DecisionTableTest`](raa-core/src/test/java/io/github/oleksiifenin/raa/core/DecisionTableTest.java), [`ReconcilerTest`](raa-core/src/test/java/io/github/oleksiifenin/raa/core/ReconcilerTest.java), [`PostgresReconcilerTest`](raa-postgres/src/test/java/io/github/oleksiifenin/raa/postgres/PostgresReconcilerTest.java), [`KillMatrixTest`](raa-postgres/src/test/java/io/github/oleksiifenin/raa/postgres/KillMatrixTest.java), [`RandomizedKillTest`](raa-postgres/src/test/java/io/github/oleksiifenin/raa/postgres/RandomizedKillTest.java), [`LangChain4jKillMatrixTest`](examples/langchain4j-refund/src/test/java/io/github/oleksiifenin/raa/examples/refund/LangChain4jKillMatrixTest.java) |
+| Deadline and maximum effect duration; escalation instead of "not done" | [`DecisionTableTest`](raa-core/src/test/java/io/github/oleksiifenin/raa/core/DecisionTableTest.java), [`ReconcilerTest`](raa-core/src/test/java/io/github/oleksiifenin/raa/core/ReconcilerTest.java), [`PostgresReconcilerTest`](raa-postgres/src/test/java/io/github/oleksiifenin/raa/postgres/PostgresReconcilerTest.java), [`PostgresActionRunnerTest`](raa-postgres/src/test/java/io/github/oleksiifenin/raa/postgres/PostgresActionRunnerTest.java) |
+| Lease and deadline decisions use database time | **Argued, not verified:** the decisions take the time the journal reads from PostgreSQL (`clock_timestamp()`) and neither core nor raa-postgres reads the JVM clock, but every test runs with the two clocks in sync, so none would fail if a decision used the JVM clock |
+| Repair of LangChain4j chat memory from the journal | [`JournalChatMemoryRepairTest`](raa-langchain4j/src/test/java/io/github/oleksiifenin/raa/langchain4j/JournalChatMemoryRepairTest.java), [`LangChain4jKillMatrixTest`](examples/langchain4j-refund/src/test/java/io/github/oleksiifenin/raa/examples/refund/LangChain4jKillMatrixTest.java) (mode (b)) |
+
+**Verification status (2026-11-23, PostgreSQL 14 and 18):**
 
 * **Verified — process kill.** A child JVM is killed with SIGKILL at four points of a tool call (after the claim; effect
   applied with the response held; response received but not recorded; recorded but not handed back) and a second JVM
@@ -58,7 +68,7 @@ tool call**, one that **pauses** it past its lease, and negative controls provin
   the library see the duplicate effect, so the harness can detect one.
 * **Verified — journal rules.** One live lease per key and fenced writes of stale attempts (journal TCK on PostgreSQL),
   the recorded result on repeat and the conflict on changed arguments, unknown outcomes never retried silently,
-  deadlines and escalation, database time only (runner, reconciler and decision-table tests).
+  deadlines and escalation (runner, reconciler and decision-table tests).
 * **Verified — LangChain4j adapter** through a real `AiServices` with a scripted model, on LangChain4j 1.14.0 and
   1.23.0: a tool runs once, a regenerated call or a call after lost memory gets the recorded result, a crash during the
   tool is retried with the same idempotency key, concurrent same-key calls run the tool once, invalid arguments and a
@@ -120,9 +130,28 @@ tool call**, one that **pauses** it past its lease, and negative controls provin
   rows and more indexes, the runtime). In the 8-thread phase each thread starts its next call when the previous one
   returns, so its latencies are those of a saturated pool, not of a given offered load. The numbers belong to this
   machine; a database across a network adds its round-trip time to every statement. A measurement, not a gate.
-* **Argued, not verified yet:** failover behavior.
+* **Argued, not verified yet:** failover behavior; that decisions use database time rather than the JVM clock (the
+  tests run with both clocks in sync).
 
-## Quick start (API as implemented, not released)
+## Quick start
+
+The artifacts are not on Maven Central yet. Until then, `./gradlew publishToMavenLocal -Pversion=0.1.0` in a clone
+installs them into `~/.m2`; add `mavenLocal()` to the repositories. The BOM keeps the `raa-*` versions in line:
+
+```kotlin
+dependencies {
+    implementation(platform("io.github.oleksii-fenin:raa-bom:0.1.0"))
+    implementation("io.github.oleksii-fenin:raa-core")
+    implementation("io.github.oleksii-fenin:raa-postgres")
+    implementation("io.github.oleksii-fenin:raa-langchain4j")      // with your own dev.langchain4j:langchain4j ≥ 1.14.0
+    implementation("io.github.oleksii-fenin:raa-opentelemetry")    // optional
+    testImplementation("io.github.oleksii-fenin:raa-testkit")      // optional: kill tests of your own tools
+}
+```
+
+In Maven, import `raa-bom` in `<dependencyManagement>` (`<type>pom</type>`, `<scope>import</scope>`) and declare the
+modules without versions. The JARs are Java 17 bytecode with `Automatic-Module-Name` set to their package
+(`io.github.oleksiifenin.raa.core`, …).
 
 ```java
 // 1. Journal in your PostgreSQL (plain SQL migration shipped for Flyway/Liquibase). Every journal operation is
@@ -225,7 +254,7 @@ sequenceDiagram
     R->>J: SUCCEEDED / FAILED / ESCALATED
 ```
 
-Modules: `raa-core` (no framework dependencies), `raa-storage-api` (the storage contract; core brings it in
+Modules (each published, versions aligned by `raa-bom`): `raa-core` (no framework dependencies), `raa-storage-api` (the storage contract; core brings it in
 transitively) and exactly one storage implementation that depends only on that contract — `raa-postgres` (PostgreSQL ≥ 14)
 is the only supported one today; you choose it when wiring, core never knows which database it is. Other databases are
 welcome if they pass the `raa-journal-tck` conformance suite. Plus `raa-langchain4j`, `raa-opentelemetry`, `raa-testkit` (fault injection and a kill-test harness
@@ -244,7 +273,7 @@ Checked against public docs on 2026-11-09 (see [`docs/research/`](docs/research)
 | Crash mid side effect | `UNKNOWN` → per-policy resolution, lookup, escalation | retried after timeout; idempotency is on you | block re-run ¹ | step retried; idempotency is on you | retried until success | republished (if configured) |
 | Stale-worker fencing of results | attempt number on every write | not documented ² | not documented ² | not documented ² | not documented ² | not documented ² |
 | Whole workflows, timers, long waits, compensation | **no** | **strong** | **strong** | **strong** | no | no |
-| Maturity | design | production | production | production (1.x since 07.2026) | mature (7.x) | production |
+| Maturity | 0.1.0, not published yet | production | production | production (1.x since 07.2026) | mature (7.x) | production |
 
 ¹ From a third-party test, not from Restate's docs — unverified. ² Not found in their docs during desk research;
 absence is not proof.
@@ -261,10 +290,12 @@ was found.
 
 * [`docs/DESIGN.md`](docs/DESIGN.md) — requirements, quality scenarios, modules, API, lifecycle, storage, failure
   table, test plan, roadmap.
-* [`docs/adr/0001-guarantee-model-and-postgres-claim.md`](docs/adr/0001-guarantee-model-and-postgres-claim.md)
-* [`docs/adr/0002-framework-integration-boundary.md`](docs/adr/0002-framework-integration-boundary.md)
-* [`docs/OPEN-QUESTIONS.md`](docs/OPEN-QUESTIONS.md) — decisions needed before code.
+* [`docs/adr/`](docs/adr) — accepted decisions: the guarantee model and the PostgreSQL claim (0001), the framework
+  integration boundary (0002), argument parsing and hashing (0003), reconciler lookups and the action key (0004), the
+  LangChain4j default memory id that is no scope (0005), the journal operation timeout as a storage setting (0006),
+  the fencing token with the row's creation time (0007).
+* [`docs/OPEN-QUESTIONS.md`](docs/OPEN-QUESTIONS.md) — open and decided questions (name, publication).
 
 ## License
 
-Apache-2.0 (the license file is added with the first code).
+Apache-2.0, see [`LICENSE`](LICENSE).

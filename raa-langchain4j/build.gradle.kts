@@ -1,5 +1,6 @@
 plugins {
     id("raa.java-library")
+    id("raa.publishing")
 }
 
 description = "LangChain4j adapter of reliable-agent-actions: a decorating ToolExecutor and the tool wrapping."

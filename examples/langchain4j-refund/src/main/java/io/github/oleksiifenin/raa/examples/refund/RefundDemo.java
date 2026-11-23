@@ -15,6 +15,11 @@ public final class RefundDemo {
     private RefundDemo() {
     }
 
+    /**
+     * Runs the demo and prints both answers and the number of refunds the payment API made.
+     *
+     * @param args not used
+     */
     public static void main(String[] args) {
         try (PostgreSQLContainer postgres = new PostgreSQLContainer("postgres:18-alpine");
              FakeDownstream paymentApi = FakeDownstream.start(false, true, false)) { // no deduplication downstream

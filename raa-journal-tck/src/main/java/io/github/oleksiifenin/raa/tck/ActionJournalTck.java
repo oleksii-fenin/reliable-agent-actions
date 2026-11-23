@@ -59,6 +59,10 @@ public abstract class ActionJournalTck {
     /** Upper bound for every poll. */
     protected static final Duration POLL_TIMEOUT = Duration.ofSeconds(15);
 
+    /** For subclasses; a storage module's test class extends this suite. */
+    protected ActionJournalTck() {
+    }
+
     private static final SecureRandom RANDOM = new SecureRandom();
     private static final String OWNER = "tck-owner";
     private static final byte[] MATERIAL = hash();
@@ -1046,7 +1050,12 @@ public abstract class ActionJournalTck {
                 "{\"orderId\":\"order-42\"}", null, OWNER, lease, Duration.ofMinutes(1), Duration.ofMinutes(10));
     }
 
-    /** Reads the row through a claim that writes nothing. */
+    /**
+     * Reads the row through a claim that writes nothing.
+     *
+     * @param key the key hash of an existing row
+     * @return the row as the claim saw it
+     */
     protected final ActionRecord read(byte[] key) {
         return journal().claim(request(key, null, LONG_LEASE), (request, row, now) -> {
             if (row.isEmpty()) {
@@ -1056,7 +1065,12 @@ public abstract class ActionJournalTck {
         }).record();
     }
 
-    /** Creates the row with attempt 1 and moves it to {@code state}. */
+    /**
+     * Creates the row with attempt 1 and moves it to {@code state}.
+     *
+     * @param key the key hash of a row that does not exist yet
+     * @param state the state to leave the row in
+     */
     protected final void moveTo(byte[] key, ActionState state) {
         journal().claim(request(key, null, LONG_LEASE), table());
         switch (state) {
@@ -1092,7 +1106,11 @@ public abstract class ActionJournalTck {
         return journal().takeReconcileBatch(hold, 10_000).stream().anyMatch(row -> Arrays.equals(row.keyHash(), key));
     }
 
-    /** The real decision table of the core for an at-least-once policy. */
+    /**
+     * The real decision table of the core for an at-least-once policy.
+     *
+     * @return a new decision table
+     */
     protected static DecisionTable table() {
         return new DecisionTable(ActionPolicy.atLeastOnce()
                 .key((call, args) -> ActionKey.of("tck", "refund"))
@@ -1100,7 +1118,13 @@ public abstract class ActionJournalTck {
                 .deadline(Duration.ofMinutes(10)));
     }
 
-    /** A decider that always returns the same decision for an existing row and starts attempt 1 otherwise. */
+    /**
+     * A decider that always returns the same decision for an existing row and starts attempt 1 otherwise.
+     *
+     * @param verdict the verdict for an existing row
+     * @param write the write for an existing row
+     * @return the decider
+     */
     protected static ClaimDecider fixed(ClaimVerdict verdict, JournalWrite write) {
         ClaimDecision decision = new ClaimDecision(verdict, write);
         return (request, row, now) -> row.isPresent()
@@ -1122,7 +1146,14 @@ public abstract class ActionJournalTck {
         };
     }
 
-    /** A claim request with this test's scope and argument hashes and this suite's owner. */
+    /**
+     * A claim request with this test's scope and argument hashes and this suite's owner.
+     *
+     * @param key the key hash
+     * @param providerCallId the tool-call id of the model provider, or {@code null}
+     * @param lease the lease of a new attempt
+     * @return the request
+     */
     protected final ClaimRequest request(byte[] key, String providerCallId, Duration lease) {
         return request(key, providerCallId, lease, OWNER);
     }
@@ -1145,7 +1176,11 @@ public abstract class ActionJournalTck {
         return scope;
     }
 
-    /** A random key hash. */
+    /**
+     * A random key hash.
+     *
+     * @return 32 random bytes
+     */
     protected static byte[] newKey() {
         return hash();
     }
@@ -1160,7 +1195,11 @@ public abstract class ActionJournalTck {
         return keys.stream().anyMatch(candidate -> Arrays.equals(candidate, key));
     }
 
-    /** Polls {@code condition} every 20 ms until it holds, failing after {@link #POLL_TIMEOUT}. */
+    /**
+     * Polls {@code condition} every 20 ms until it holds, failing after {@link #POLL_TIMEOUT}.
+     *
+     * @param condition the condition to wait for
+     */
     protected static void eventually(BooleanSupplier condition) {
         long deadline = System.nanoTime() + POLL_TIMEOUT.toNanos();
         while (!condition.getAsBoolean()) {

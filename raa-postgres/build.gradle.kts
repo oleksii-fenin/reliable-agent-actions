@@ -1,5 +1,6 @@
 plugins {
     id("raa.java-library")
+    id("raa.publishing")
 }
 
 description = "PostgreSQL implementation of the reliable-agent-actions storage contract."

@@ -1,5 +1,6 @@
 plugins {
     id("raa.java-library")
+    id("raa.publishing")
 }
 
 description = "OpenTelemetry spans and metrics for reliable-agent-actions (docs/DESIGN.md §10), on the OpenTelemetry API."

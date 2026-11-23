@@ -26,13 +26,12 @@ tasks.withType<JavaCompile>().configureEach {
     options.compilerArgs.addAll(listOf("-Xlint:all,-options,-processing", "-Werror", "-parameters"))
 }
 
+// Every doclint group, missing comments and tags included; a warning fails the build (week 7, D1).
 tasks.withType<Javadoc>().configureEach {
-    // javadoc fails on a package without types; skeleton modules have only package-info.java until their roadmap week.
-    val documentedTypes = source.filter { it.name != "package-info.java" }
-    onlyIf("module has types to document") { !documentedTypes.isEmpty }
     (options as StandardJavadocDocletOptions).apply {
         encoding = "UTF-8"
-        addBooleanOption("Xdoclint:all,-missing", true)
+        addBooleanOption("Xdoclint:all", true)
+        addBooleanOption("Werror", true)
     }
 }
 

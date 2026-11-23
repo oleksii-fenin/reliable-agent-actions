@@ -80,7 +80,7 @@ Priority: Q1, Q1p, Q2 (the thesis) > Q6 > Q4 > Q3 > Q7 > Q5.
 | `raa-opentelemetry` | `OpenTelemetryActionTelemetry`: spans + metrics on the OTel API | core, `opentelemetry-api` | v0.1 |
 | `raa-testkit` | fault points, `FakeDownstream` (HTTP, effect counter, dedup and lookup switchable), kill/pause harness, in-memory journal for unit tests | core | v0.1 (published: users can kill-test their own tools) |
 | `examples/langchain4j-refund` | runnable example with a scripted fake chat model, Testcontainers PostgreSQL | all v0.1 | not published |
-| `raa-bom` | Maven BOM (`java-platform`) pinning the versions of all published `raa-*` modules, so users import one version | — | v0.1 (cheap; added when the first artifacts are published, week 7) |
+| `raa-bom` | Maven BOM (`java-platform`) pinning the versions of all published `raa-*` modules, so users import one version | — | v0.1 (added in week 7, stage D) |
 | `raa-spring-ai` | `ReliableToolCallback` | core, Spring AI 2.0.x | v0.2 |
 | `raa-spring-boot-starter` | auto-config (journal from `DataSource`, reconciler/renewer scheduling, properties) | core, postgres, Spring Boot | v0.2 |
 | `raa-mcp` | server-side wrapper for MCP Java SDK tool handlers | core | v0.2+ |
@@ -658,7 +658,7 @@ server wrapper, strict mode, optional local-transaction mode (journal row and a 
 | Framework API churn | adapter breaks | public APIs only, floor+latest CI matrix, weekly scheduled build |
 | Schedule (8–12 h/week) | v0.1 slips | stage gates; week 3 alone is a demonstrable result |
 
-## 13. Verified vs argued (as of 2026-11-19)
+## 13. Verified vs argued (as of 2026-11-23)
 
 * Verified by executed tests (`./gradlew build`, PostgreSQL 14 and 18): the §6 decision table per row and policy;
   key canonicalization; policy validation; `raa-postgres` passes `raa-journal-tck` (claim locking and re-decision,
@@ -749,7 +749,33 @@ server wrapper, strict mode, optional local-transaction mode (journal row and a 
   Floors on the same pool: a `select 1` transaction p50 0.32 ms, a one-row insert transaction p50 1.5 ms; two
   transactions of that shape are about 60 % of the median, the rest is not broken down. The test asserts only that
   every action succeeded once; the nearest-rank percentile has its own test (`OverheadPercentileTest`).
+* Verified on 2026-11-23 (week 7, stage D), locally: `./gradlew publish -Pversion=0.1.0` writes the eight artifacts
+  (`raa-bom` and the seven libraries) to `build/staging-deploy` in the Maven repository layout, each library with its
+  sources and javadoc jars, MD5 and SHA-1 checksums that match, a POM with the metadata Maven Central lists as required
+  (name, description, URL, license, developer, SCM) and `Automatic-Module-Name` set to the module's package; a
+  `-SNAPSHOT` version is refused. A consumer project built against that directory alone compiles the quick start
+  (core, postgres, opentelemetry, langchain4j on 1.14.0, the BOM) and a journal test class that extends the TCK and
+  calls its helpers, both from Gradle module metadata and from the POMs only, as Maven resolves them; this check found
+  that the TCK declared core as runtime only, although its protected helpers return a core type. Javadoc runs with every
+  doclint group and fails on a warning. These checks run in CI on every push and pull request and in the nightly
+  run (job `published-artifacts`): the separate build `consumer-check` takes every `raa-*` module from the staging
+  directory only, once from the Gradle module metadata and once from the POMs alone, and checks the files, POMs,
+  checksums, module names and BOM (`PublishedArtifactsTest`); compiles the calls of the README quick start, steps 1
+  to 4 (`QuickStart`, a copy, so a change of the README is not followed by itself); and runs the whole TCK from the
+  published jars in a source set compiled against `raa-journal-tck` alone (`InMemoryJournalConformanceTest`); a step
+  before it asserts that staging a `-SNAPSHOT` version fails. Mutations, each failing that job (run locally
+  2026-11-23 on the final version; in both resolution modes where they concern the artifacts): the TCK's core back to
+  `implementation`, a module missing from the BOM, no `Automatic-Module-Name`, no POM description, no javadoc jar, no
+  SCM `developerConnection`, the PostgreSQL driver `compileOnly` instead of `runtimeOnly`, the snapshot guard removed.
+  Not checked: that each mode really resolved from the metadata it names (set in the repository's `metadataSources`),
+  and the README's `publishToMavenLocal` route (`mavenLocal()`), which the job does not use. Not done: signing (OQ5,
+  the key does not exist yet), the upload to Maven Central.
 * Not yet verified: Q4 (recovery timing) and Q7 (scheduled check against the latest LangChain4j).
+* Argued, not verified (found in the stage D review, 2026-11-23): that lease and deadline decisions use database time
+  and never the JVM clock. The journal passes `clock_timestamp()` to the decider and stamps every time column with it,
+  and neither core nor `raa-postgres` reads the JVM clock, but every test runs with the database and JVM clocks in
+  sync, so a regression to the JVM clock would pass them. A test needs the two clocks apart (for example a database
+  whose clock is shifted).
 * Desk research (not re-verified by the author): framework signatures and memory ordering
   (`docs/research/framework-integration-surface.md`), competitor behavior (`docs/research/*.md`).
 * Argued: every guarantee in §1/§2 until the §9 tests exist and pass.
@@ -995,3 +1021,21 @@ whole insert transaction, not an isolated commit, so the text says "two transact
 the rest unattributed; the documented command adds `--rerun` (a second run with the same property was up to date);
 the 8-thread phase is labelled a closed loop at saturation and gets its own warm-up; the percentile uses integer
 arithmetic and has a test. The numbers above come from three runs of the final version.
+
+Revision 20 (2026-11-23, roadmap week 7 stage D): release preparation without signing. Javadoc checks every doclint
+group, missing comments included, and fails on a warning; the 17 warnings that this found (protected helpers of the
+TCK, the example) are fixed. `raa.publishing` (buildSrc) publishes the seven libraries and the new `raa-bom` with the
+POM metadata of Maven Central to a staging directory, refuses a `-SNAPSHOT` version, and sets `Automatic-Module-Name`
+to each module's package. `raa-journal-tck` now exposes core as `api`: its protected helpers return the core's decision
+table, so a third-party journal's test class could not compile against the published POM (found by a consumer build
+against the staged artifacts, §13). README: final status, a table from each guarantee to its tests, coordinates with
+the BOM. Signing and the upload wait for the author's key and "ок" (OQ5).
+Independent review (Codex, read-only), fixed the same day: the README listed tests for "decisions use database time",
+but none of them tells the database clock from the JVM clock; the claim is now labelled argued, not verified (§13).
+The consumer check of the staged artifacts, first a local script, is now the `consumer-check` build and the CI job
+`published-artifacts` (§13). Its first version did not catch the TCK's core as `implementation`: the testkit and the
+main source set put core on the test's class path, so the TCK test now has a source set that sees only the TCK.
+Independent review of the check (Claude, approve with comments), fixed the same day: "compiles the quick start" was a
+different program, so `QuickStart` now makes the README's calls; the POM-only mode had an `artifact()` fallback that
+turns a missing POM into a jar without dependencies; the test task now takes the staged files as input, so a re-staged
+POM is checked again locally; the job refuses an empty version, has a timeout, and tests the snapshot guard.

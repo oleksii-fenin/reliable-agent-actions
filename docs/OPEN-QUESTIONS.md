@@ -68,6 +68,12 @@ pending). Planned coordinates: `io.github.oleksii-fenin:raa-core`, `io.github.ol
 packages cannot contain `-`, so packages use `io.github.oleksiifenin.raa.*` (DECIDED 2026-11-09). Publishing waits for
 v0.1 and the author's "ок"; the GPG signing key is not created yet. Blocks: week 7.
 
+Status 2026-11-23: the unsigned 0.1.0 artifacts build into a staging directory (`./gradlew publish -Pversion=0.1.0`,
+`build/staging-deploy`) with the required POM metadata, sources, javadoc and checksums (DESIGN §13). Still needed for
+the upload: the author's GPG key (each file needs an `.asc`), the namespace verification, and the author's "ок". The
+POM names the developer by name and GitHub URL, without an e-mail; Central's requirements page shows an e-mail in its
+example but does not say it is required (https://central.sonatype.org/publish/requirements/, read 2026-11-23).
+
 ## OQ6. Spring AI in v0.1 or v0.2 (scope) — **DECIDED 2026-11-09: v0.2**
 
 **Recommendation: v0.2.** v0.1 already fills 7 weeks at 8–12 h/week; LangChain4j is the primary target and the planned

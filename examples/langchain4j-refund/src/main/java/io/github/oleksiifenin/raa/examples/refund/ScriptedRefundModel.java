@@ -61,7 +61,11 @@ public final class ScriptedRefundModel implements ChatModel {
         return respond(AiMessage.from(toolResult));
     }
 
-    /** Returns how many times the model called the tool again after a result. */
+    /**
+     * Returns how many times the model called the tool again after a result.
+     *
+     * @return the number of repeated calls, at most {@link #MAX_RECALLS}
+     */
     public int recalls() {
         return Math.min(recalls.get(), MAX_RECALLS);
     }

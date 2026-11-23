@@ -55,3 +55,35 @@ jobs:
           ${{ inputs.rerun-tests && '--rerun-tasks' || '' }}
           -Porg.gradle.java.installations.fromEnv=JAVA_HOME_${{ matrix.test-java }}_X64,JAVA_HOME_25_X64
           -Porg.gradle.java.installations.auto-download=false
+
+  published-artifacts:
+    # The artifacts as an application gets them (docs/DESIGN.md §13, week 7 stage D): staged with the release version
+    # of gradle.properties, then consumer-check builds against that directory alone, from the Gradle module metadata
+    # and from the POMs only (as Maven resolves them). Nothing is uploaded or signed.
+    name: published artifacts (staging directory, consumer build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+      - uses: gradle/actions/setup-gradle@v5
+      - name: Stage the artifacts
+        run: |
+          version=$(sed -n 's/^version=//p' gradle.properties)
+          version=${version%-SNAPSHOT}
+          test -n "$version" || { echo "no version= line in gradle.properties"; exit 1; }
+          echo "RAA_VERSION=$version" >> "$GITHUB_ENV"
+          ./gradlew publish -Pversion="$version" -Porg.gradle.java.installations.auto-download=false
+      - name: A snapshot version is refused
+        run: |
+          if ./gradlew :raa-core:publish -Pversion=0.0.1-SNAPSHOT > snapshot.log 2>&1; then
+            echo "publishing a -SNAPSHOT version to the staging directory succeeded"; exit 1
+          fi
+          grep -q "Staging needs a release version" snapshot.log || { cat snapshot.log; exit 1; }
+      - name: Consumer build from Gradle module metadata
+        run: ./gradlew -p consumer-check check -PraaVersion="$RAA_VERSION" --rerun-tasks
+      - name: Consumer build from the POMs only
+        run: ./gradlew -p consumer-check check -PraaVersion="$RAA_VERSION" -PpomOnly --rerun-tasks
