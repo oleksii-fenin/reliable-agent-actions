@@ -56,7 +56,7 @@ call**, one that **pauses** it past its lease, and negative controls proving the
 | A succeeded action is never re-executed; the recorded result on repeat; a conflict on changed material arguments | [`ActionRunnerTest`](raa-core/src/test/java/io/github/oleksiifenin/raa/core/ActionRunnerTest.java), [`DecisionTableTest`](raa-core/src/test/java/io/github/oleksiifenin/raa/core/DecisionTableTest.java), [`KillMatrixTest`](raa-postgres/src/test/java/io/github/oleksiifenin/raa/postgres/KillMatrixTest.java), [`LangChain4jContractTest`](raa-langchain4j/src/test/java/io/github/oleksiifenin/raa/langchain4j/LangChain4jContractTest.java) |
 | An unknown outcome is never retried silently | [`DecisionTableTest`](raa-core/src/test/java/io/github/oleksiifenin/raa/core/DecisionTableTest.java), [`ReconcilerTest`](raa-core/src/test/java/io/github/oleksiifenin/raa/core/ReconcilerTest.java), [`PostgresReconcilerTest`](raa-postgres/src/test/java/io/github/oleksiifenin/raa/postgres/PostgresReconcilerTest.java), [`KillMatrixTest`](raa-postgres/src/test/java/io/github/oleksiifenin/raa/postgres/KillMatrixTest.java), [`RandomizedKillTest`](raa-postgres/src/test/java/io/github/oleksiifenin/raa/postgres/RandomizedKillTest.java), [`LangChain4jKillMatrixTest`](examples/langchain4j-refund/src/test/java/io/github/oleksiifenin/raa/examples/refund/LangChain4jKillMatrixTest.java) |
 | Deadline and maximum effect duration; escalation instead of "not done" | [`DecisionTableTest`](raa-core/src/test/java/io/github/oleksiifenin/raa/core/DecisionTableTest.java), [`ReconcilerTest`](raa-core/src/test/java/io/github/oleksiifenin/raa/core/ReconcilerTest.java), [`PostgresReconcilerTest`](raa-postgres/src/test/java/io/github/oleksiifenin/raa/postgres/PostgresReconcilerTest.java), [`PostgresActionRunnerTest`](raa-postgres/src/test/java/io/github/oleksiifenin/raa/postgres/PostgresActionRunnerTest.java) |
-| Lease and deadline decisions use database time | **Argued, not verified:** the decisions take the time the journal reads from PostgreSQL (`clock_timestamp()`) and neither core nor raa-postgres reads the JVM clock, but every test runs with the two clocks in sync, so none would fail if a decision used the JVM clock |
+| Lease and deadline decisions use database time | [`DatabaseClockSkewTest`](raa-postgres/src/test/java/io/github/oleksiifenin/raa/postgres/DatabaseClockSkewTest.java) (the journal database's clock one hour ahead of the JVM clock and one hour behind it: lease, renewal, deadline, lookup window, lookup backoff and the reconciler decide as with the clocks in sync, and the journal TCK passes; scope and limits in DESIGN §13) |
 | Repair of LangChain4j chat memory from the journal | [`JournalChatMemoryRepairTest`](raa-langchain4j/src/test/java/io/github/oleksiifenin/raa/langchain4j/JournalChatMemoryRepairTest.java), [`LangChain4jKillMatrixTest`](examples/langchain4j-refund/src/test/java/io/github/oleksiifenin/raa/examples/refund/LangChain4jKillMatrixTest.java) (mode (b)) |
 
 **Verification status (2026-11-23, PostgreSQL 14 and 18):**
@@ -68,7 +68,8 @@ call**, one that **pauses** it past its lease, and negative controls proving the
   the library see the duplicate effect, so the harness can detect one.
 * **Verified — journal rules.** One live lease per key and fenced writes of stale attempts (journal TCK on PostgreSQL),
   the recorded result on repeat and the conflict on changed arguments, unknown outcomes never retried silently,
-  deadlines and escalation (runner, reconciler and decision-table tests).
+  deadlines and escalation (runner, reconciler and decision-table tests). The lease and deadline decisions stay the
+  same with the database clock an hour ahead of the JVM clock or an hour behind it.
 * **Verified — LangChain4j adapter** through a real `AiServices` with a scripted model, on LangChain4j 1.14.0 and
   1.23.0: a tool runs once, a regenerated call or a call after lost memory gets the recorded result, a crash during the
   tool is retried with the same idempotency key, concurrent same-key calls run the tool once, invalid arguments and a
@@ -130,8 +131,7 @@ call**, one that **pauses** it past its lease, and negative controls proving the
   rows and more indexes, the runtime). In the 8-thread phase each thread starts its next call when the previous one
   returns, so its latencies are those of a saturated pool, not of a given offered load. The numbers belong to this
   machine; a database across a network adds its round-trip time to every statement. A measurement, not a gate.
-* **Argued, not verified yet:** failover behavior; that decisions use database time rather than the JVM clock (the
-  tests run with both clocks in sync).
+* **Argued, not verified yet:** failover behavior.
 
 ## Quick start
 
@@ -293,7 +293,7 @@ was found.
 * [`docs/adr/`](docs/adr) — accepted decisions: the guarantee model and the PostgreSQL claim (0001), the framework
   integration boundary (0002), argument parsing and hashing (0003), reconciler lookups and the action key (0004), the
   LangChain4j default memory id that is no scope (0005), the journal operation timeout as a storage setting (0006),
-  the fencing token with the row's creation time (0007).
+  the fencing token with the row's creation time (0007), the clock test that shifts the database clock (0008).
 * [`docs/OPEN-QUESTIONS.md`](docs/OPEN-QUESTIONS.md) — open and decided questions (name, publication).
 
 ## License

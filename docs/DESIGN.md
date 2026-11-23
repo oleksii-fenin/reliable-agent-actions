@@ -521,7 +521,7 @@ otherwise the guarantee is reduced to "per failover epoch".
 | Ambiguous commit / DB faults | Toxiproxy between client and PostgreSQL: response or request lost at COMMIT for claim and record; blackhole, database down, paused container (fail closed, Q6); pool exhaustion; every journal operation bounded while blackholed; a row lock held by a frozen process | R10, §8 rows, ADR-0006 |
 | LangChain4j contract | scripted fake `ChatModel`; specs and `ReturnBehavior` preserved; `IMMEDIATE` rejected; concurrent tool execution with same-key calls; replay text; memory repair yields a history where every tool call has a result, including the superseded-call-id case | R6, R7 |
 | OTel | `InMemorySpanExporter` / `InMemoryMetricReader`: one span per action with key hash, policy, attempt, outcome | R8 |
-| Clock | child JVM under libfaketime shifted ±1 h; decisions unchanged | DB-time rule |
+| Clock | the journal database's clock 1 h ahead of the JVM clock and 1 h behind it (`DatabaseClockSkewTest`: in a test database `clock_timestamp()` is a function that adds the shift, ahead of `pg_catalog` in its `search_path`); lease, renewal, deadline, lookup window, backoff and reconciler decisions unchanged, journal TCK passes | DB-time rule |
 | Wiring | tool without policy, `IMMEDIATE` tool, `maxEffectDuration ≥ deadline`, deadline > dedup window → rejected at build time | R5 |
 | Overhead (Q3, Q5) | timed loop of 10 000 actions against local PostgreSQL, sequential and on 8 threads (`OverheadBenchmarkTest`, off unless `-PoverheadActions`); p50/p99 and throughput in README, not a gate | Q3, Q5 |
 
@@ -771,11 +771,45 @@ server wrapper, strict mode, optional local-transaction mode (journal row and a 
   and the README's `publishToMavenLocal` route (`mavenLocal()`), which the job does not use. Not done: signing (OQ5,
   the key does not exist yet), the upload to Maven Central.
 * Not yet verified: Q4 (recovery timing) and Q7 (scheduled check against the latest LangChain4j).
-* Argued, not verified (found in the stage D review, 2026-11-23): that lease and deadline decisions use database time
-  and never the JVM clock. The journal passes `clock_timestamp()` to the decider and stamps every time column with it,
-  and neither core nor `raa-postgres` reads the JVM clock, but every test runs with the database and JVM clocks in
-  sync, so a regression to the JVM clock would pass them. A test needs the two clocks apart (for example a database
-  whose clock is shifted).
+* Verified on 2026-11-23 (after stage D), locally: lease and deadline decisions use database time, not the JVM clock
+  (`DatabaseClockSkewTest`, `raa-postgres`; ADR-0008).
+  * Harness: in a database of its own, `clock_timestamp()` is a function in the schema `raa_test_clock` that adds the
+    shift (one hour ahead or one hour behind) to `pg_catalog.clock_timestamp()`. The database's `search_path`
+    (`public, raa_test_clock, pg_catalog`) finds it before `pg_catalog`, and the journal schema is created after it,
+    so the column defaults use it too. A check asserts that the clocks are apart and that rows carry shifted times.
+  * Scenarios, through `ReliableActions` and in both directions (each regression shows in at least one of them):
+    - a live lease keeps another call out;
+    - the lease renewer extends a lease from the database time of the renewal;
+    - before the deadline, an expired lease lets the next call start attempt 2; after the deadline the action
+      escalates;
+    - a call that finds the lease expired marks the attempt unknown with the database's time;
+    - the lookup waits for the maximum effect duration and for the backoff of an unreachable lookup, and the "call
+      again after" time it names is the row's;
+    - the reconciler marks an expired attempt unknown and looks it up only after the window opens;
+    - the reconciler escalates an unknown action without a lookup, and one whose lookup is unreachable, only at the
+      deadline; before it, the unreachable lookup backs off with the database's times;
+    - the reconciler abandons a failed action only after its deadline;
+    - an operator's resolution is stamped with the database time;
+    - the whole journal TCK passes.
+  * Mutations, 19, each failing the test (run by hand, locally, on the final version):
+    - the claim's database time taken from the JVM clock, and its `select` changed to `now()`;
+    - each time rule of the decision table on the JVM clock: lease, deadline, lookup window, backoff;
+    - the reconciler's time from the JVM clock, and separately each of its three deadline checks (failed action,
+      unknown without a lookup, unreachable lookup) and its lookup window;
+    - the journal's shared `NOW` fragment on `now()`;
+    - one statement at a time on `now()`: the state change of a claim, the resolution, the lease renewal, the
+      reconciler's take, the retention delete, the recorded success and the operator's resolution.
+  * Not checked, and deciding nothing: the time stamps `seen_at` of the call history and `redacted_at`.
+  * Not covered:
+    - The shift replaces the function by name. It does not move the database server's operating-system clock, so
+      time read another way (`now()`, `current_timestamp`, a schema-qualified `pg_catalog.clock_timestamp()`) stays
+      unshifted. A statement that read it would disagree with the shifted rows, as the `now()` mutations show, but
+      this is not proven for every statement.
+    - The in-memory journal of the testkit takes its clock as a parameter and is not part of this test.
+    - Waits and timeouts (lease renewal interval, `inProgressWait`, operation timeouts) use the JVM's monotonic
+      clock. They only wait and decide no lease or deadline.
+    - The harness check assumes the container and the JVM read the same wall clock, within a minute. Local and
+      rootless Docker do; a remote Docker host with a drifting clock would fail it.
 * Desk research (not re-verified by the author): framework signatures and memory ordering
   (`docs/research/framework-integration-surface.md`), competitor behavior (`docs/research/*.md`).
 * Argued: every guarantee in §1/§2 until the §9 tests exist and pass.
@@ -1039,3 +1073,25 @@ Independent review of the check (Claude, approve with comments), fixed the same 
 different program, so `QuickStart` now makes the README's calls; the POM-only mode had an `artifact()` fallback that
 turns a missing POM into a jar without dependencies; the test task now takes the staged files as input, so a re-staged
 POM is checked again locally; the job refuses an empty version, has a timeout, and tests the snapshot guard.
+
+Revision 21 (2026-11-23, after stage D): the database-time rule is tested. `DatabaseClockSkewTest` (`raa-postgres`)
+runs the decisions with the journal database's clock one hour ahead of the JVM clock and one hour behind it, through
+`ReliableActions` and with the whole journal TCK, and a harness check shows that the clocks are apart (§13). The §9
+row planned a child JVM under libfaketime, as does the compliance list of ADR-0001; the shifted database clock
+replaces it (ADR-0008): it needs no native library on the runner and runs in the build's own test JVM, and
+only the difference between the two clocks matters. The README row moves from "argued, not verified" to this test.
+Mutations of every time rule of the decision table and of the reconciler first showed that the planned scenarios
+missed the lookup window, the backoff and the reconciler's deadline; the test now has a scenario for each.
+Two independent reviews (Codex, read-only, "reject" both times), fixed the same day. The first found these not
+covered: the reconciler's deadline checks for an unknown action without a lookup and after an unreachable lookup, the
+backoff times the journal writes for an unreachable lookup, and the lease renewal through the runner. Each now has a
+scenario and a mutation that fails it. The lease (90 s) now outlives the test timeout, so a pause cannot expire it, and
+the tables of the shifted database are created in `public`. Accepted: the two suite runs share one database per
+direction, which needs the sequential test execution the build uses. The second review found that the time of a
+claim's state change was not tied to database time, and that "every journal statement on `now()`" overstated a
+mutation of the shared `NOW` fragment. The scenarios now check the state change and the "call again after" time, and
+every journal statement that writes a time was mutated on its own. The one that survived, the operator's resolution,
+now has a scenario. A third review (Claude, read-only, approve with comments): the README cell no longer reports the
+hand-run mutations (they stay here, dated), ADR-0001's clock line is superseded by ADR-0008 (accepted by the
+author) instead of contradicting §9, and §13 is split into parts. The claim is limited to the time rules and
+statements listed in §13, each with a mutation; a new one needs its own scenario.
