@@ -79,8 +79,9 @@ Status 2026-11-25: the namespace is verified (the author, 2026-11-25). Signing i
 with the author's local gpg, and CI checks the same setup with a throwaway key (DESIGN §13). 0.1.0 is signed and
 uploaded by the author from his machine through the Central Portal's web page (`docs/RELEASING.md`). The key needs no
 GitHub secret, and the upload needs no Portal token. A release from GitHub Actions on a tag, as planned above, is
-left for a later version. Still needed: the author's key on a key server, and the author's "ок" for the upload, the
-tag and the GitHub release.
+left for a later version. On 2026-11-26 the author's public key (a primary key that signs, no subkeys) was sent to
+keyserver.ubuntu.com and fetched back from it. Still needed: the author's "ок" for the upload, the tag and the GitHub
+release.
 
 ## OQ6. Spring AI in v0.1 or v0.2 (scope) — **DECIDED 2026-11-09: v0.2**
 

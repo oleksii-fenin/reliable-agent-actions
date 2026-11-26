@@ -778,8 +778,9 @@ server wrapper, strict mode, optional local-transaction mode (journal row and a 
   with a throwaway key in a separate keyring: unsigned staging with and without `-Psigned`; signed staging with and
   without `-Psigned`, with the right fingerprint, another one, and none; and a signature copied onto another file.
   Each case gave the expected result. The new step of the CI job `published-artifacts` signs the staging with a
-  throwaway key it makes on the runner. It was run locally as a script, not yet on a runner. The author's key, the
-  upload and the bundle's acceptance by the Central Portal are not checked; the steps are in `docs/RELEASING.md`.
+  throwaway key it makes on the runner; it passed on GitHub Actions on 2026-11-26 (run 45875261161, commit 321c26a,
+  the sign tasks executed and the consumer check with `-Psigned` passed). The author's key, the upload and the
+  bundle's acceptance by the Central Portal are not checked; the steps are in `docs/RELEASING.md`.
 * Not yet verified: Q4 (recovery timing) and Q7 (scheduled check against the latest LangChain4j).
 * Verified on 2026-11-23 (after stage D), locally: lease and deadline decisions use database time, not the JVM clock
   (`DatabaseClockSkewTest`, `raa-postgres`; ADR-0008).
