@@ -3,7 +3,6 @@ package io.github.oleksiifenin.raa.langchain4j;
 import dev.langchain4j.agent.tool.ReturnBehavior;
 import dev.langchain4j.agent.tool.ToolSpecification;
 import dev.langchain4j.service.tool.AiServiceTool;
-import dev.langchain4j.service.tool.ToolService;
 import io.github.oleksiifenin.raa.core.ActionPolicy;
 import io.github.oleksiifenin.raa.core.ActionTelemetry;
 import io.github.oleksiifenin.raa.core.JournaledPolicy;
@@ -36,6 +35,7 @@ public final class ReliableTools {
     private final OutcomeRenderer renderer;
     private final Set<String> immediateReturnAllowed;
     private final ArgumentsParser parser = new ArgumentsParser();
+    private final ToolBeanScanner scanner = new ToolBeanScanner();
     private final ActionTelemetry toolTelemetry;
 
     private ReliableTools(Builder builder) {
@@ -68,15 +68,23 @@ public final class ReliableTools {
     }
 
     /**
-     * Wraps the {@code @Tool} methods of a bean, found with {@link ToolService#findTools(Object)}. Like {@code findTools},
-     * this does not register compensating actions that {@code AiServices.tools(Object)} may register for the bean.
+     * Wraps the {@code @Tool} methods of a bean. They are found as LangChain4j 1.20 and later find them: the methods
+     * of the bean's class, its superclasses and the default methods of its interfaces, and overrides without
+     * {@code @Tool} of annotated methods (as in a proxy). On LangChain4j 1.14 to 1.19 this can find more tools than
+     * {@code AiServices.tools(bean)} (inherited ones, or those of a class-based proxy); each of them needs a policy.
+     *
+     * <p>Unlike {@code AiServices.tools(Object)}, this registers no compensating actions for the bean and does not run
+     * LangChain4j's wiring checks of {@code @P} (1.15 and later): a default value that does not parse fails the call,
+     * before the tool runs.
      *
      * @param toolBean an object with {@code @Tool} methods
      * @return the tools
      * @throws IllegalStateException if a tool has no policy or is a journaled tool with immediate return
+     * @throws dev.langchain4j.service.IllegalConfigurationException if the bean is a class or an {@code Iterable},
+     *         or has no {@code @Tool} methods
      */
     public List<AiServiceTool> wrap(Object toolBean) {
-        return wrap(ToolService.findTools(Objects.requireNonNull(toolBean, "toolBean")));
+        return wrap(scanner.tools(Objects.requireNonNull(toolBean, "toolBean")));
     }
 
     /**

@@ -18,7 +18,7 @@ import java.util.function.Supplier;
  * {@code execute_tool} span of the GenAI semantic conventions; the tool itself runs unchanged. Journaled tools report
  * the same through {@link ReliableToolExecutor}.
  *
- * <p>An asynchronous execution ({@code executeAsync}, LangChain4j 1.23 and later) goes to the tool unchanged and is
+ * <p>An asynchronous execution ({@code executeAsync}, LangChain4j 1.20 and later) goes to the tool unchanged and is
  * not observed: an observation belongs to the thread that starts it.
  */
 final class ObservedToolExecutor implements ToolExecutor {

@@ -261,7 +261,7 @@ public final class ReliableToolExecutor implements dev.langchain4j.service.tool.
     // scope = chat memory id, but null for LangChain4j's "default" id (ADR-0005)
 }
 public final class ReliableTools {
-    public static List<AiServiceTool> wrap(Object toolBean, ReliableActions actions);   // via ToolService.findTools;
+    public static List<AiServiceTool> wrap(Object toolBean, ReliableActions actions);   // own @Tool scan (ADR-0009);
     public static Builder builder(ReliableActions actions);  // renderer(OutcomeRenderer), allowImmediateReturn(String...)
     public List<AiServiceTool> wrap(Object toolBean); public List<AiServiceTool> wrap(List<AiServiceTool> tools);
     // rejects tools without a policy and tools with ReturnBehavior.IMMEDIATE unless allowImmediateReturn(toolName) (§8);
@@ -609,7 +609,7 @@ never changes an action.
   `error.type = tool_error` for a result marked as an error, the exception class for a throw. For every wrapped tool,
   read-only (`NONE`) tools included (author, 2026-11-19); `ReliableTools.builder(...).toolSpans(false)` turns it off,
   and without a telemetry `NONE` tools stay unchanged. An asynchronous execution of a wrapped `NONE` tool
-  (`executeAsync`, LangChain4j 1.23+) goes to the tool unchanged and is not observed. The `reliable_action` span is its child. Arguments, results
+  (`executeAsync`, LangChain4j 1.20+) goes to the tool unchanged and is not observed. The `reliable_action` span is its child. Arguments, results
   and the conversation id are not recorded (personal data). Spring AI has its own `spring.ai.tool` observation.
 * Metrics: `raa.actions` (counter of run calls, not inspections: `raa.policy`, `raa.outcome`; `exception` for a
   call that threw), `raa.journal.duration`
@@ -786,6 +786,12 @@ server wrapper, strict mode, optional local-transaction mode (journal row and a 
   all eight POMs answered on repo1.maven.org; each of the 74 published jar, POM, module and `.asc` files is
   byte-identical (sha256) to the local staging, and the signature of `raa-core-0.1.0.jar` downloaded from there is a
   good signature of `8D4F33BE3631C885FC1FD4B93B38FDCE92C5089E`. Tag `v0.1.0` points at 8c1d67c.
+* Verified on 2026-11-27, locally: `ReliableTools.wrap(Object)` uses no LangChain4j internals (ADR-0009). Its own
+  scan gives the same specifications and return behaviours as `ToolService.findTools`, compared as an oracle on
+  1.14.0, 1.23.0 and 1.24.1 for beans without supertype tools and on 1.23.0 and 1.24.1 also for inherited, interface
+  default, JDK-proxy and class-based-proxy tools (`ToolBeanScannerTest`; 6 cases skipped on 1.14.0 by design). Seven
+  hand-run mutations of the scan (no superclasses, no interface defaults, no supertype lookup, no argument-exception
+  wrapping, no exception propagation, no override deduplication, no class check) each fail at least one test.
 * Not yet verified: Q4 (recovery timing) and Q7 (scheduled check against the latest LangChain4j).
 * Verified on 2026-11-23 (after stage D), locally: lease and deadline decisions use database time, not the JVM clock
   (`DatabaseClockSkewTest`, `raa-postgres`; ADR-0008).
@@ -920,7 +926,7 @@ Revision 11 (2026-11-16, roadmap week 4; author's decision ADR-0005): `raa-langc
 the floors). Facts checked in the sources of both versions: `findTools` builds executors with
 `propagateToolExecutionExceptions(true)`, so a tool's exception arrives as `ToolExecutionException(cause)` and the
 classifier gets the cause; `ToolArgumentsException` is thrown before the method runs and becomes
-`ActionRejectedException` (definitely not applied); `executeAsync` exists only from some version after 1.14.0 and is
+`ActionRejectedException` (definitely not applied); `executeAsync` exists since LangChain4j 1.20.0 and is
 not overridden; without `@MemoryId` the memory id is `"default"` (ADR-0005: no scope). Arguments are parsed by the
 adapter with Jackson (strict: object only, no duplicate keys; numbers exact; coerced to the schema type, ADR-0003).
 A freshly run tool's own `ToolExecutionResult` is passed on (contents included); every other outcome is rendered as
@@ -1130,3 +1136,10 @@ publisher API with a user token the author generated and typed in himself, as `U
 stopped at `VALIDATED` until the author pressed Publish; the web page's upload, planned in Revision 22, was not used
 because the author was signed in to a second Portal account without the namespace. `docs/RELEASING.md` lists both
 routes. The token never entered the repository, the build or CI.
+
+Revision 24 (2026-11-27, ADR-0009, author: "Свой поиск @Tool"): `ReliableTools.wrap(Object)` no longer calls
+`ToolService.findTools`, which is in a class LangChain4j marks `@Internal` and so broke ADR-0002 Decision 5. The
+package-private `ToolBeanScanner` finds the tools with public API only, following the scan of LangChain4j 1.20 and
+later on every supported version; on 1.14 to 1.19 it can find more tools than `AiServices.tools(bean)`, and each of
+them needs a policy. LangChain4j's `@P` wiring check (1.15+) no longer runs for wrapped beans; a bad default fails
+the call before the tool runs. Tests keep `findTools` as an oracle (§13).

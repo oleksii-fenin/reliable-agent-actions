@@ -1,6 +1,6 @@
 # LangChain4j 1.23.0 and Spring AI 2.0.2: tool-execution integration surface
 
-> Desk research, 2026-11-09, by an AI research agent from shallow clones of the sources at the named tags and GitHub pages. Not re-verified by the author. Re-check before publishing.
+> Desk research, 2026-11-09, by an AI research agent from shallow clones of the sources at the named tags and GitHub pages. Re-verified 2026-11-26 by a second AI agent against the sources of LangChain4j 1.24.1 and Spring AI 2.1.0, with spot checks by the author's coding agent; the corrections under "Re-check 2026-11-26" at the end override the text above where they differ.
 
 Report below. I checked LangChain4j at tag `1.23.0` and Spring AI at tag `v2.0.2` against shallow clones of the source. LC4J = `https://github.com/langchain4j/langchain4j/blob/1.23.0/`, SAI = `https://github.com/spring-projects/spring-ai/blob/v2.0.2/`.
 
@@ -128,3 +128,37 @@ Use a **delegating `ToolCallback`** that wraps each callback from `ToolCallbacks
 - Your business-args key fits well because the callback never sees the provider id.
 - Scope (conversation or tenant) has to come from the user-supplied `ToolContext` map.
 - If you need the provider tool-call id (for correlation or the `gen_ai.tool.call.id` span attribute), you would have to provide a custom `ToolCallingManager`. That is heavier and means reimplementing `DefaultToolCallingManager`'s limits, observation and exception logic, so keep it optional.
+
+## Re-check 2026-11-26
+
+All claims above were checked against the sources (read 2026-11-26); 47 of 68 hold as written. Corrections:
+
+- **Versions.** LangChain4j: 1.24.0 (GitHub release 2026-11-18), 1.24.1 on Maven Central 2026-11-26; 1.23.0 was
+  2026-10-28. Spring AI: 2.1.0 GA and 2.0.3, both 2026-11-20; 2.1.0 keeps Java 17 and moves to Spring Boot 4.2.0.
+- **`ToolService` is `@Internal`** (1.14.0 and 1.24.1). `findTools`, which `ReliableTools.wrap(Object)` used in
+  0.1.0, is a public static method of that class, so the adapter depended on a class LangChain4j marks internal.
+  Resolved on 2026-11-27 by an own scan with public API only (ADR-0009). What `findTools` scans changed twice: 1.16
+  added inherited and interface default methods, 1.20 the `@Tool` lookup in supertypes for class-based proxies
+  (checked in the bytecode of 1.15.0 to 1.23.0 from Maven Central, 2026-11-27).
+- **`ToolExecutor.executeAsync`** is `@since 1.20.0` (absent in 1.19.0), not 1.23.
+- **`ReturnBehavior`** has three values: `TO_LLM`, `IMMEDIATE`, `IMMEDIATE_IF_LAST` (already in 1.23.0).
+- **Tool-call ids.** LangChain4j does generate one in one place: the Google GenAI mapper uses a random UUID when the
+  provider sends none. A regenerated call can have a different or absent id; either way it identifies a call, not a
+  business operation.
+- **Hooks.** Before/after hooks and listeners have no supported way to skip a call and return a recorded result; a
+  throwing before hook aborts the call. Replaying a recorded result needs an executor decorator (as in ADR-0002).
+- **Spring AI 2.1.0.** `ToolCallingManager` adds `executeToolCalls(Prompt, ChatResponse, ToolCallDecisions)` (default
+  throws `UnsupportedOperationException`). The provider tool-call id is public in
+  `ToolCallingObservationContext.getToolCallId()` and reaches confirmation policies and tool-call decisions, but not
+  `ToolCallback`; so span correlation does not need a custom `ToolCallingManager`. The session advisor (2.1.0)
+  answers unanswered stored tool calls with an unknown-result message. Tool-call limits per turn and
+  `@Tool(requiresConfirmation)` exist. No business-key deduplication of side effects was found.
+- **Spring AI PR #6462** (identical-argument loop guard) is still open, not released.
+- **Decorating Spring AI callbacks.** Wrap every `ToolCallback` before it is attached to the request; a
+  `BeanPostProcessor` covers managed beans only, a `ToolCallbackResolver` wrapper only callbacks resolved through it.
+- **Release cadence.** LangChain4j went from 1.13.0 (2026-04-09) to 1.23.0 (2026-10-28) in about six and a half
+  months, not a year.
+- **This library on LangChain4j 1.24.1** (run locally 2026-11-26, `-Plangchain4jVersion=1.24.1`): the tests of
+  `raa-langchain4j` (51) and `examples/langchain4j-refund` (34) pass. CI still tests 1.14.0 and 1.23.0.
+- Still unverified: the exact provider error texts for malformed history; whether quarkus-langchain4j or a Spring
+  Boot starter adds tool spans.

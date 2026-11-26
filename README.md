@@ -263,20 +263,21 @@ planned for v0.2. Details: [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## How it compares
 
-Checked against public docs on 2026-11-09 (see [`docs/research/`](docs/research)); to be re-verified before release.
+Checked against public docs on 2026-11-09 and again on 2026-11-26 (see [`docs/research/`](docs/research)).
 
 | | This library | Temporal (Java SDK, + Spring AI preview) | Restate (Java SDK) | DBOS Transact Java | gruelbox transaction-outbox | Spring Modulith event registry |
 |---|---|---|---|---|---|---|
-| Extra infrastructure | none (your PostgreSQL) | Temporal service | Restate server | none (PostgreSQL) | none (your DB) | none (your DB) |
+| Extra infrastructure | none (your PostgreSQL) | Temporal service | Restate server | none (PostgreSQL or CockroachDB) | none (your DB) | none (your DB) |
 | Unit of protection | one agent tool call (business key) | activity in a workflow | `run` block in a handler | step / workflow | scheduled method call | event × listener |
 | Regenerated call with a new tool-call id | deduplicated by business key | new activity → runs again | new journal entry → runs again (invocation idempotency keys exist, ~24 h, you derive them) | new step → runs again | dedup only with `uniqueRequestId` you supply | no |
-| Crash mid side effect | `UNKNOWN` → per-policy resolution, lookup, escalation | retried after timeout; idempotency is on you | block re-run ¹ | step retried; idempotency is on you | retried until success | republished (if configured) |
-| Stale-worker fencing of results | attempt number on every write | not documented ² | not documented ² | not documented ² | not documented ² | not documented ² |
+| Crash mid side effect | `UNKNOWN` → per-policy resolution, lookup, escalation | retried after timeout; idempotency is on you | block re-run ¹ | step retried; idempotency is on you | retried until success or blocked after N attempts | republished (if configured) |
+| Stale-worker fencing of results | attempt number on every write | a timed-out attempt's late result is rejected; the external effect is not fenced | stale attempts fenced by epoch in the journal; the external effect is not fenced | not documented ² | not documented ² | not documented ² |
 | Whole workflows, timers, long waits, compensation | **no** | **strong** | **strong** | **strong** | no | no |
 | Maturity | 0.1.0 (Maven Central, 11.2026) | production | production | production (1.x since 07.2026) | mature (7.x) | production |
 
-¹ From a third-party test, not from Restate's docs — unverified. ² Not found in their docs during desk research;
-absence is not proof.
+¹ From a third-party test, not from Restate's docs — unverified; Restate's agent guide says tool side effects in
+`ctx.run` run exactly once, its databases guide admits a small re-execution window for handler writes. ² Not found in
+their docs during desk research; absence is not proof.
 
 **Where alternatives are stronger:** anything that is a multi-step business process with waits, retries across steps
 and compensation. This library is **complementary**: it can protect the side effect *inside* a Temporal activity or a
@@ -284,7 +285,7 @@ DBOS step.
 **Where it fits:** a Java service that already runs an agent with LangChain4j and a PostgreSQL, and needs
 side-effecting tools not to fire twice — without adopting a workflow engine. Similar ledger ideas exist as small Python,
 TypeScript and Go projects; on the JVM, no library doing per-tool-call deduplication with unknown-outcome reconciliation
-was found.
+was found (searched again 2026-11-26).
 
 ## Documents
 
@@ -293,7 +294,8 @@ was found.
 * [`docs/adr/`](docs/adr) — accepted decisions: the guarantee model and the PostgreSQL claim (0001), the framework
   integration boundary (0002), argument parsing and hashing (0003), reconciler lookups and the action key (0004), the
   LangChain4j default memory id that is no scope (0005), the journal operation timeout as a storage setting (0006),
-  the fencing token with the row's creation time (0007), the clock test that shifts the database clock (0008).
+  the fencing token with the row's creation time (0007), the clock test that shifts the database clock (0008), the
+  own `@Tool` scan of the LangChain4j adapter (0009).
 * [`docs/OPEN-QUESTIONS.md`](docs/OPEN-QUESTIONS.md) — open and decided questions (name, publication).
 
 ## License

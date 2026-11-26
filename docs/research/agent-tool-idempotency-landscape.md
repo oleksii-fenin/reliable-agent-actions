@@ -1,6 +1,6 @@
 # Agent tool-call idempotency: landscape
 
-> Desk research, 2026-11-09, by an AI research agent from public docs/GitHub pages. Not re-verified by the author. Items marked UNVERIFIED are unconfirmed. Re-check every fact before publishing.
+> Desk research, 2026-11-09, by an AI research agent from public docs/GitHub pages. Re-verified 2026-11-26 by a second AI research agent, with spot checks by the author's coding agent; the corrections under "Re-check 2026-11-26" at the end override the text above where they differ. Items marked UNVERIFIED are unconfirmed.
 
 The niche is real but narrow. The "idempotency ledger for agent tool calls" idea is not original: there are at least six small open-source implementations, all in Python, TypeScript or Go. Durable-execution engines already cover the "resume after crash without redoing completed steps" part, including on the JVM. What I found no JVM library doing is per-tool-call deduplication with explicit handling of unknown outcomes. That is the only defensible spot.
 
@@ -82,3 +82,40 @@ Position it as complementary to durable engines, not a replacement. Otherwise ev
 2. Ship it as small adapters (a LangChain4j `ToolExecutor` decorator, a Spring AI `ToolCallback` wrapper) over a framework-free core. Propose the LangChain4j piece upstream as a `langchain4j-community` module early. Distribution matters more than code here.
 3. A second front with less competition: a server-side variant for MCP Java SDK / Spring AI MCP servers. It would accept a `_meta` idempotency key now and follow a future SEP. Comment on the MCP idempotency discussion while it is still open.
 4. Drop "exactly-once" from the name and use "effectively-once" with stated preconditions (idempotent or verifiable sink). The research literature and every competing README already say a ledger alone can't promise it.
+
+## Re-check 2026-11-26
+
+Every claim except the step-memoization list (Inngest, Trigger.dev, …; still UNVERIFIED) was checked again (read
+2026-11-26). Corrections:
+
+- **arXiv 2609.29095 (corrected).** "Where Does Exactly-Once Live?" does not speak of issuance or sinks. It finds that
+  when a call's outcome cannot be read back (still in flight, or delivered twice) the tool contract decides; its
+  Proposition 1 shows that no verification-only policy is exactly-once under late commits without a bound on the
+  in-flight time, and service-side idempotency keys cut duplicates from 28 % to 4 %. This library bounds the in-flight
+  time with `maxEffectDuration` before a lookup and recommends downstream keys. https://arxiv.org/abs/2609.29095
+- **LangChain issue #33787 (corrected).** It is about the agent re-attempting the original tool call after a
+  human-in-the-loop "edit" decision, fixed 2026-09-18; not a timeout retry.
+- **MCP.** SEP-1686 deferred idempotency to a dedicated proposal (stated in the motivation of PR #3182, so no longer
+  UNVERIFIED). New: issue #3394 (open since 2026-09-27) reproduces lost-response retries re-running a mutating
+  `tools/call`; an idempotency-key SEP was offered but not filed.
+- **Temporal + Spring AI.** Still Public Preview, versioned separately; requires Temporal Java SDK 1.40+, Spring AI
+  2.1+ and Spring Boot 4.2+. Tools can also be Nexus operations or `@SideEffectTool` (`Workflow.sideEffect`).
+- **Restate.** The integration guide wraps each LLM call (and, fine-grained, each tool call) in `ctx.run`;
+  restatedev/ai-examples has Python and TypeScript only (no Java sample, now confirmed).
+- **DBOS.** AI integrations: OpenAI Agents SDK, Pydantic AI, LlamaIndex, Google ADK (Python), Vercel AI SDK
+  (TypeScript); none for Spring AI or LangChain4j. Java is at 1.3.0; `@TransactionalStep` ships in
+  `transact-spring-txstep-starter`.
+- **Microsoft Agent Framework.** Durable agents via the Durable Task extension (some packages still preview); tool
+  results are checkpointed on an Azure backend; Microsoft states checkpointing does not make external tool side
+  effects exactly-once.
+- **LangGraph.** Primary source for the node re-run on resume: https://docs.langchain.com/oss/python/langgraph/interrupts
+- **Koog.** New docs link: https://docs.koog.ai/features/agent-persistence/ (latest 1.3.0, no deduplication).
+- **Akka.** SDK docs: durable session memory and workflows, downstream calls must be idempotent
+  (https://doc.akka.io/about/akka-sdk.html). Akka's 2026 marketing guides claim the runtime records each tool call
+  and escalates unknown outcomes; no SDK API or doc page for it was found.
+- **Spring AI 2.1.0** adds per-turn tool-call limits, `@Tool(requiresConfirmation)` and `ToolAdvisor` hooks; none
+  deduplicates side effects. The LangChain4j and Spring AI issue trackers have no tool-call idempotency issue.
+- **Counts and versions.** rune0-dev/agent-ledger 5 stars (others 0); transferwise/idempotence4j 82 stars, 2.0.0;
+  the OpenAI forum thread did not converge (one reply proposes a pending state and a downstream check).
+- **JVM search** (GitHub, Maven Central, web; LangChain4j, Spring AI, Quarkus, LangGraph4j, Koog, Embabel, MCP Java
+  SDK): still no JVM library doing per-tool-call deduplication with unknown-outcome reconciliation.

@@ -1,6 +1,6 @@
 # Durable execution and outbox libraries: comparison
 
-> Desk research, 2026-11-09, by an AI research agent from public docs/GitHub pages. Not re-verified by the author. Items marked UNVERIFIED are unconfirmed. Re-check every fact before publishing.
+> Desk research, 2026-11-09, by an AI research agent from public docs/GitHub pages. Re-verified 2026-11-26 by a second AI research agent against the same primary sources, with spot checks by the author's coding agent; the corrections are listed under "Re-check 2026-11-26" at the end and override the table where they differ. Items marked UNVERIFIED are unconfirmed.
 
 I could not get a primary-source statement that any of the six systems deduplicates a tool call by its business arguments. In every one, a duplicate side effect is possible if the process crashes after the call but before its result is recorded. Each of them needs the user to derive a key from the call's business arguments to stop an LLM re-issue from running twice. That is the gap your library fills.
 
@@ -23,7 +23,7 @@ I could not get a primary-source statement that any of the six systems deduplica
   - **Temporal:** a new LLM turn creates a new activity, so it gets a new Activity ID and is not deduplicated.
   - **Restate:** a new run block is a new journal entry, also not deduplicated.
   - **DBOS:** the same applies to a new step.
-  - **What users must build:** a key from canonical business arguments (normalisation, hashing, a per-tool policy), plus an insert-or-load claim. That could be a DBOS child workflow with ID = hash(args), a Restate idempotency key (only 24 h by default), an outbox `uniqueRequestId` (7 days), or a dedup table for Modulith, db-scheduler and JobRunr. Also, as far as I found, none of them fences a stale attempt with an attempt number.
+  - **What users must build:** a key from canonical business arguments (normalisation, hashing, a per-tool policy), plus an insert-or-load claim. That could be a DBOS child workflow with ID = hash(args), a Restate idempotency key (only 24 h by default), an outbox `uniqueRequestId` (7 days), or a dedup table for Modulith, db-scheduler and JobRunr. Temporal (per-attempt task token) and Restate (per-attempt epoch) reject results of a stale attempt in their own log; none of them fences the external side effect, and DBOS, the outbox and Modulith document no such fencing (corrected 2026-11-26).
 - **Where they are clearly stronger:**
   - Temporal and Restate cover the whole agent loop (timers, signals, replay, observability, multiple languages). Temporal also ships `temporal-spring-ai` (Public Preview), which runs Spring AI chat-model and tool calls as activities. [22][3]
   - DBOS needs only PostgreSQL, like you, but also gives whole-workflow recovery and atomic database-write steps.
@@ -63,3 +63,35 @@ I could not get a primary-source statement that any of the six systems deduplica
 23. https://docs.restate.dev/ai/sdk-integrations/integration-guide
 
 Third-party, not Restate docs (behind the UNVERIFIED claim about Restate re-running a block): https://nerdleveltech.com/restate-durable-agent-duplicate-tool-calls-tested
+
+## Re-check 2026-11-26
+
+Every claim above was checked again against the primary sources (read 2026-11-26). Confirmed unless listed here.
+
+- **Fencing (corrected).** Temporal rejects a late completion of a timed-out or rescheduled attempt (`NOT_FOUND`,
+  "the Service discarded the in-flight task"; the task token is unique per Activity Task Execution) [24]. Restate
+  fences stale handler attempts, which carry lower epochs, at the epoch boundary [25]. Neither fences the external
+  side effect itself.
+- **DBOS infrastructure (corrected).** PostgreSQL or CockroachDB; the Spring Boot starter requires PostgreSQL [26].
+  Besides `JdbcStepFactory` there are `JdbiStepFactory` and `JooqStepFactory` [8].
+- **gruelbox (made precise).** An entry is retried until it succeeds or is blocked after `blockAfterAttempts`; a blocked
+  entry needs `unblock()` [12].
+- **Restate.** Idempotency retention is configurable per service (`idempotencyRetention`, default 24 h) [27]. Restate's
+  durable-agents guide says side effects of tool executions in `ctx.run` are executed exactly once [28]; its databases
+  guide admits a small re-execution window for handler writes [29]. The re-run of a `run` block after a crash is still
+  shown only by the third-party test.
+- **temporal-spring-ai.** Model calls always run as activities; a tool runs as an activity only when it is an activity
+  stub (Nexus stubs run as Nexus operations, `@SideEffectTool` in `Workflow.sideEffect()`, plain tools on the workflow
+  thread) [22]. Published on Maven Central as `io.temporal:temporal-spring-ai` since 1.36.0; still Public Preview.
+- **Spring Modulith.** 2.2 adds an `ABANDONED` status; the staleness monitor is off by default (all durations 0) [14].
+- **Latest versions.** Temporal Java SDK 1.41.1 (16 Nov 2026) [3]; Restate Java SDK 2.11.0 (28 Oct 2026, unchanged) [6];
+  DBOS Transact Java 1.3.0 (12 Nov 2026; Spring Boot starter since 0.8, 30 Apr 2026) [10]; gruelbox 7.1.785
+  (21 Oct 2026, unchanged) [13]; Spring Modulith 2.2.0 (19 Nov 2026; 2.1.x: 2.1.3) [15]; db-scheduler 17.2.0
+  (Nov 2026) [17]; JobRunr 9.0.5 (17 Nov 2026) [21]. Years confirmed from Maven Central publish dates.
+
+24. https://docs.temporal.io/troubleshooting/request-failures and https://docs.temporal.io/activity-execution
+25. https://docs.restate.dev/references/architecture
+26. https://docs.dbos.dev/java/reference/lifecycle
+27. https://docs.restate.dev/services/configuration
+28. https://docs.restate.dev/ai/patterns/durable-agents
+29. https://docs.restate.dev/guides/databases

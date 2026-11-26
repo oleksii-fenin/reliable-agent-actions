@@ -65,7 +65,7 @@ class ToolSpansTest {
         assertThat(events).endsWith("action ended Failed", "tool ended true");
     }
 
-    /** The wrapped read-only tool keeps the tool's asynchronous path (LangChain4j 1.23+), unobserved. */
+    /** The wrapped read-only tool keeps the tool's asynchronous path (LangChain4j 1.20+), unobserved. */
     @Test
     void readOnlyTool_withAnAsynchronousPath_keepsIt() {
         ToolExecutionResult asyncResult = ToolExecutionResult.builder().resultText("async").build();
@@ -75,7 +75,7 @@ class ToolSpansTest {
                 return "sync";
             }
 
-            // Not an @Override: the 1.14.0 floor has no executeAsync; on 1.23 it overrides the default.
+            // Not an @Override: the 1.14.0 floor has no executeAsync; from 1.20 it overrides the default.
             public CompletableFuture<ToolExecutionResult> executeAsync(ToolExecutionRequest request,
                     InvocationContext context) {
                 return CompletableFuture.completedFuture(asyncResult);
