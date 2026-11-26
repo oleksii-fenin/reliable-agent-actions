@@ -55,12 +55,13 @@ Added by design to make that contract safe for third-party implementations: a **
 and retention cases from DESIGN §9 written against the SPI. A storage implementation is "supported" only if it passes
 the suite. An in-memory journal exists only in the testkit for unit tests and is not a production option.
 
-## OQ5. Maven Central publication — **namespace: `io.github.oleksii-fenin` (registration pending)**
+## OQ5. Maven Central publication — **namespace: `io.github.oleksii-fenin` (verified)**
 
 * Namespace: `io.github.<your-github-login>` (verified automatically through the GitHub account on the Sonatype Central
   Portal) — **or** your own domain if you own one (looks more professional, needs a DNS TXT record).
 * When: **after v0.1** passes the full test plan, not earlier — a broken 0.0.x on Central is permanent.
 * How: Central Portal + Gradle publishing plugin, GPG-signed, from GitHub Actions on tag; snapshots not published.
+  (For 0.1.0 superseded: signed and uploaded from the author's machine, see Status 2026-11-25.)
 * Account: artifacts and commits are published under the author's own GitHub account and name.
 
 Status 2026-11-09: namespace **`io.github.oleksii-fenin`** registered on the Sonatype Central Portal (verification
@@ -73,6 +74,13 @@ Status 2026-11-23: the unsigned 0.1.0 artifacts build into a staging directory (
 the upload: the author's GPG key (each file needs an `.asc`), the namespace verification, and the author's "ок". The
 POM names the developer by name and GitHub URL, without an e-mail; Central's requirements page shows an e-mail in its
 example but does not say it is required (https://central.sonatype.org/publish/requirements/, read 2026-11-23).
+
+Status 2026-11-25: the namespace is verified (the author, 2026-11-25). Signing is wired: `-Psign` signs every file
+with the author's local gpg, and CI checks the same setup with a throwaway key (DESIGN §13). 0.1.0 is signed and
+uploaded by the author from his machine through the Central Portal's web page (`docs/RELEASING.md`). The key needs no
+GitHub secret, and the upload needs no Portal token. A release from GitHub Actions on a tag, as planned above, is
+left for a later version. Still needed: the author's key on a key server, and the author's "ок" for the upload, the
+tag and the GitHub release.
 
 ## OQ6. Spring AI in v0.1 or v0.2 (scope) — **DECIDED 2026-11-09: v0.2**
 

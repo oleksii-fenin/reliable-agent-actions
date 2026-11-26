@@ -59,7 +59,8 @@ jobs:
   published-artifacts:
     # The artifacts as an application gets them (docs/DESIGN.md §13, week 7 stage D): staged with the release version
     # of gradle.properties, then consumer-check builds against that directory alone, from the Gradle module metadata
-    # and from the POMs only (as Maven resolves them). Nothing is uploaded or signed.
+    # and from the POMs only (as Maven resolves them). Then the same staging signed with a throwaway key made on the
+    # runner, checked with -Psigned. Nothing is uploaded; the author's key never leaves his machine.
     name: published artifacts (staging directory, consumer build)
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -87,3 +88,17 @@ jobs:
         run: ./gradlew -p consumer-check check -PraaVersion="$RAA_VERSION" --rerun-tasks
       - name: Consumer build from the POMs only
         run: ./gradlew -p consumer-check check -PraaVersion="$RAA_VERSION" -PpomOnly --rerun-tasks
+      - name: Signed staging, with a throwaway key
+        run: |
+          set -euo pipefail
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -m 700 "$GNUPGHOME"
+          gpg --batch --pinentry-mode loopback --passphrase '' \
+            --quick-generate-key "CI throwaway <ci@example.invalid>" rsa3072 sign 1d
+          key=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr/ {print $10; exit}')
+          test -n "$key"
+          rm -rf build/staging-deploy
+          ./gradlew publish -Pversion="$RAA_VERSION" -Psign -Psigning.gnupg.keyName="$key" \
+            -Psigning.gnupg.homeDir="$GNUPGHOME" -Porg.gradle.java.installations.auto-download=false
+          ./gradlew -p consumer-check check -PraaVersion="$RAA_VERSION" -Psigned -PsigningKey="$key" \
+            -PgnupgHome="$GNUPGHOME" --rerun-tasks

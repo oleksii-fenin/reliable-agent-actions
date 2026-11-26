@@ -1,9 +1,15 @@
 // Maven publication of every released raa-* module and of raa-bom (docs/DESIGN.md §4, docs/OPEN-QUESTIONS.md OQ5):
 // the POM metadata Maven Central requires, the sources and javadoc jars of raa.java-library, and a staging repository.
 // `./gradlew publish -Pversion=0.1.0` writes the Maven repository layout with checksums to build/staging-deploy in the
-// root project. Nothing is uploaded anywhere; signing waits for the author's GPG key (OQ5).
+// root project. Nothing is uploaded anywhere.
+//
+// With -Psign every published file also gets an .asc signature, made by the local gpg (`useGpgCmd`): the key stays in
+// the author's keyring and gpg-agent asks for its passphrase, so neither is in the build. The key is chosen with
+// -Psigning.gnupg.keyName=<key id>. Without -Psign, as in CI, the staging directory is unsigned (docs/OPEN-QUESTIONS.md
+// OQ5).
 plugins {
     `maven-publish`
+    signing
 }
 
 val repositoryUrl = "https://github.com/oleksii-fenin/reliable-agent-actions"
@@ -81,6 +87,17 @@ publishing {
             url = uri(rootProject.layout.buildDirectory.dir("staging-deploy"))
         }
     }
+}
+
+signing {
+    useGpgCmd()
+    sign(publishing.publications)
+}
+
+tasks.withType<Sign>().configureEach {
+    // A plain local value: the configuration cache cannot serialize references to the script object.
+    val signingRequested = providers.gradleProperty("sign").isPresent
+    onlyIf("signing is requested with -Psign") { signingRequested }
 }
 
 // Maven Central accepts no -SNAPSHOT version, so a staged snapshot could never be released.

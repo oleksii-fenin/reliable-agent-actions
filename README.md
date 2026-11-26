@@ -1,10 +1,11 @@
 # reliable-agent-actions
 
 > **Status: 0.1.0 complete, not published yet.** Core, the PostgreSQL journal, the reconciler with retention, the
-> operator API, the LangChain4j adapter with chat-memory repair (tested on 1.14.0 and 1.23.0), OpenTelemetry spans
-> and metrics, and the kill, pause and database-fault tests exist; the 0.1.0 artifacts build locally. Maven Central
-> publication waits for the signing key and the author's go-ahead. See the verification status below the guarantees
-> and `examples/langchain4j-refund`. Working name — see [`docs/OPEN-QUESTIONS.md`](docs/OPEN-QUESTIONS.md).
+> operator API, the LangChain4j adapter with chat-memory repair (tested on 1.14.0 and 1.23.0), OpenTelemetry spans and
+> metrics, and the kill, pause and database-fault tests exist; the 0.1.0 artifacts build and sign locally. Maven
+> Central publication waits for the author's key and go-ahead ([`docs/RELEASING.md`](docs/RELEASING.md)). See the
+> verification status below the guarantees and `examples/langchain4j-refund`. Working name — see
+> [`docs/OPEN-QUESTIONS.md`](docs/OPEN-QUESTIONS.md).
 
 A small Java library that makes **side-effecting tool calls of AI agents effectively-once**. Your agent's
 "refund the order", "send the e-mail", "create the ticket" takes effect **once per logical action** — when the external

@@ -41,6 +41,11 @@ tasks.test {
     inputs.dir(stagingRepository).withPropertyName("stagingRepository")
     systemProperty("raa.staging", stagingRepository.get())
     systemProperty("raa.version", raaVersion.get())
+    // -Psigned: the staging directory was published with -Psign, so every file must carry a good .asc signature of
+    // the key -PsigningKey=<fingerprint>, checked with the local gpg (in the keyring of -PgnupgHome=<dir> if given).
+    systemProperty("raa.signed", providers.gradleProperty("signed").isPresent.toString())
+    systemProperty("raa.signingKey", providers.gradleProperty("signingKey").getOrElse(""))
+    providers.gradleProperty("gnupgHome").orNull?.let { environment("GNUPGHOME", it) }
 }
 
 // A third-party journal's conformance test: a source set of its own, with nothing from the main source set and no

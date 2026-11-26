@@ -768,8 +768,18 @@ server wrapper, strict mode, optional local-transaction mode (journal row and a 
   `implementation`, a module missing from the BOM, no `Automatic-Module-Name`, no POM description, no javadoc jar, no
   SCM `developerConnection`, the PostgreSQL driver `compileOnly` instead of `runtimeOnly`, the snapshot guard removed.
   Not checked: that each mode really resolved from the metadata it names (set in the repository's `metadataSources`),
-  and the README's `publishToMavenLocal` route (`mavenLocal()`), which the job does not use. Not done: signing (OQ5,
-  the key does not exist yet), the upload to Maven Central.
+  and the README's `publishToMavenLocal` route (`mavenLocal()`), which the job does not use. Not done: the upload to
+  Maven Central.
+* Verified on 2026-11-25, locally: signing. `./gradlew publish -Pversion=0.1.0 -Psign
+  -Psigning.gnupg.keyName=<id>` signs every published file with the local gpg (`useGpgCmd`). That is 37 `.asc` files,
+  one for each jar, POM and module file. `consumer-check` with `-Psigned -PsigningKey=<fingerprint>` verifies each
+  with gpg. It requires a good signature (`GOODSIG`, so no expired or revoked key) made by that key (`VALIDSIG`), and
+  fails on a missing or wrong signature. It also fails when a file is signed although `-Psigned` is not set. Checked
+  with a throwaway key in a separate keyring: unsigned staging with and without `-Psigned`; signed staging with and
+  without `-Psigned`, with the right fingerprint, another one, and none; and a signature copied onto another file.
+  Each case gave the expected result. The new step of the CI job `published-artifacts` signs the staging with a
+  throwaway key it makes on the runner. It was run locally as a script, not yet on a runner. The author's key, the
+  upload and the bundle's acceptance by the Central Portal are not checked; the steps are in `docs/RELEASING.md`.
 * Not yet verified: Q4 (recovery timing) and Q7 (scheduled check against the latest LangChain4j).
 * Verified on 2026-11-23 (after stage D), locally: lease and deadline decisions use database time, not the JVM clock
   (`DatabaseClockSkewTest`, `raa-postgres`; ADR-0008).
@@ -1095,3 +1105,16 @@ now has a scenario. A third review (Claude, read-only, approve with comments): t
 hand-run mutations (they stay here, dated), ADR-0001's clock line is superseded by ADR-0008 (accepted by the
 author) instead of contradicting §9, and §13 is split into parts. The claim is limited to the time rules and
 statements listed in §13, each with a mutation; a new one needs its own scenario.
+
+Revision 22 (2026-11-25, OQ5): signing. `raa.publishing` applies the `signing` plugin with the local gpg
+(`useGpgCmd`) and signs every publication when `-Psign` is set. Without `-Psign`, as in CI, staging stays unsigned.
+The key stays in the author's keyring and gpg-agent asks for the passphrase, so the build holds neither.
+`consumer-check` verifies the signatures and the signing key with `-Psigned`, and the CI job `published-artifacts`
+signs the staging with a throwaway key made on the runner (§13). `docs/RELEASING.md` lists the release steps. OQ5
+planned the release from GitHub Actions on a tag; 0.1.0 is signed and uploaded by the author from his machine
+instead, so the key needs no GitHub secret (OQ5). Independent review (Claude, read-only; Codex was at its usage
+limit; approve with comments), fixed the same day: the key backup in `docs/RELEASING.md` wrote the secret key into
+the checkout, so it now goes to the home directory, and `*.asc` is ignored by git. A good signature of any key
+passed the check, so the check now requires the expected fingerprint and gpg's `GOODSIG`. The tag now names the
+commit that was staged, from a clean tree. The CI step stops on an empty key, and §13 no longer says the step ran on
+a runner.

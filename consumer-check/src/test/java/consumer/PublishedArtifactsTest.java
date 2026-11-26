@@ -16,6 +16,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.concurrent.TimeUnit;
 import java.util.jar.JarFile;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -27,8 +28,9 @@ import org.w3c.dom.NodeList;
 
 /**
  * What Maven Central requires of every staged artifact (https://central.sonatype.org/publish/requirements/, read
- * 2026-11-23), except the signatures, which wait for the author's key (docs/OPEN-QUESTIONS.md OQ5): the POM metadata,
- * sources and javadoc jars, and MD5 and SHA-1 checksums that match. Also the module names and the BOM's contents.
+ * 2026-11-23): the POM metadata, sources and javadoc jars, MD5 and SHA-1 checksums that match, and, when the staging
+ * directory was signed ({@code -Psigned}), a valid signature of every file (docs/OPEN-QUESTIONS.md OQ5). Also the
+ * module names and the BOM's contents.
  */
 class PublishedArtifactsTest {
 
@@ -49,6 +51,9 @@ class PublishedArtifactsTest {
 
     private final Path group = Path.of(System.getProperty("raa.staging"), GROUP.split("\\."));
     private final String version = System.getProperty("raa.version");
+    private final boolean signed = Boolean.getBoolean("raa.signed");
+    /** The fingerprint of the key that must have signed, required with {@code -Psigned}. */
+    private final String signingKey = System.getProperty("raa.signingKey", "");
 
     @Test
     void theStagingDirectory_holdsTheBomAndEveryLibrary_andNothingElse() throws IOException {
@@ -123,6 +128,65 @@ class PublishedArtifactsTest {
         assertEquals(GROUP, text(project, "groupId"));
         assertEquals(artifact, text(project, "artifactId"));
         assertEquals(version, text(project, "version"));
+    }
+
+    /**
+     * Every jar, POM and module file of the staging directory carries a signature exactly when signing was requested,
+     * and each signature is good (gpg's {@code GOODSIG}: not expired, not revoked) and made by the expected key.
+     */
+    @Test
+    void whenSigned_everyFileHasAGoodSignatureOfTheExpectedKey() throws IOException, InterruptedException {
+        if (signed) {
+            assertTrue(signingKey.matches("[0-9A-F]{40}"),
+                    "-Psigned needs -PsigningKey=<the signing key's 40-digit fingerprint>, got '" + signingKey + "'");
+        }
+        List<Path> files = new ArrayList<>();
+        try (Stream<Path> all = Files.walk(group)) {
+            all.filter(Files::isRegularFile)
+                    .filter(path -> path.getFileName().toString().matches(".*\\.(jar|pom|module)"))
+                    .forEach(files::add);
+        }
+        assertEquals(LIBRARIES.size() * 5 + 2, files.size(), "jars, POMs and module files of the staging directory");
+        List<String> problems = new ArrayList<>();
+        for (Path file : files) {
+            Path signature = Path.of(file + ".asc");
+            if (signed != Files.isRegularFile(signature)) {
+                problems.add(file.getFileName()
+                        + (signed ? " has no signature" : " is signed, although -Psigned is not set"));
+            } else if (signed) {
+                String problem = signatureProblem(signature, file);
+                if (problem != null) {
+                    problems.add(file.getFileName() + ": " + problem);
+                }
+            }
+        }
+        assertEquals(List.of(), problems);
+    }
+
+    /** What is wrong with the signature according to gpg's status lines, or {@code null} if nothing is. */
+    private String signatureProblem(Path signature, Path file) throws IOException, InterruptedException {
+        Path status = Files.createTempFile("gpg-status", ".txt");
+        try {
+            Process gpg = new ProcessBuilder("gpg", "--batch", "--status-fd", "1", "--verify", signature.toString(),
+                    file.toString())
+                    .redirectOutput(status.toFile()).redirectError(ProcessBuilder.Redirect.DISCARD).start();
+            if (!gpg.waitFor(30, TimeUnit.SECONDS)) {
+                gpg.destroyForcibly();
+                throw new IllegalStateException("gpg did not finish verifying " + signature);
+            }
+            List<String> lines = Files.readAllLines(status);
+            if (gpg.exitValue() != 0 || lines.stream().noneMatch(line -> line.startsWith("[GNUPG:] GOODSIG "))) {
+                return "no good signature (gpg exit " + gpg.exitValue() + ", " + lines + ")";
+            }
+            // VALIDSIG <signing key fingerprint> ... <primary key fingerprint> (the last field)
+            boolean byTheExpectedKey = lines.stream()
+                    .filter(line -> line.startsWith("[GNUPG:] VALIDSIG "))
+                    .map(line -> line.split(" "))
+                    .anyMatch(fields -> fields[2].equals(signingKey) || fields[fields.length - 1].equals(signingKey));
+            return byTheExpectedKey ? null : "not signed by the key " + signingKey + " (" + lines + ")";
+        } finally {
+            Files.delete(status);
+        }
     }
 
     private static void assertChecksummed(Path file) throws IOException, NoSuchAlgorithmException {

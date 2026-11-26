@@ -5,3 +5,5 @@ buildSrc/.kotlin/
 .idea/
 *.iml
 out/
+# Signatures and exported keys never belong in the repository (docs/RELEASING.md).
+*.asc
