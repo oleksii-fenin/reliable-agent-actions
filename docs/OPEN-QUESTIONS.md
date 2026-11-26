@@ -80,8 +80,11 @@ with the author's local gpg, and CI checks the same setup with a throwaway key (
 uploaded by the author from his machine through the Central Portal's web page (`docs/RELEASING.md`). The key needs no
 GitHub secret, and the upload needs no Portal token. A release from GitHub Actions on a tag, as planned above, is
 left for a later version. On 2026-11-26 the author's public key (a primary key that signs, no subkeys) was sent to
-keyserver.ubuntu.com and fetched back from it. Still needed: the author's "ок" for the upload, the tag and the GitHub
-release.
+keyserver.ubuntu.com and fetched back from it.
+
+Status 2026-11-26: 0.1.0 is published on Maven Central (DESIGN §13, Revision 23) and tagged `v0.1.0`. The upload went
+through the Portal API with a user token the author typed in himself, not through the web page; the token is not
+stored anywhere in the project. Still open for later versions: the release from GitHub Actions on a tag.
 
 ## OQ6. Spring AI in v0.1 or v0.2 (scope) — **DECIDED 2026-11-09: v0.2**
 

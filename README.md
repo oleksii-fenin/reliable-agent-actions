@@ -1,10 +1,10 @@
 # reliable-agent-actions
 
-> **Status: 0.1.0 complete, not published yet.** Core, the PostgreSQL journal, the reconciler with retention, the
-> operator API, the LangChain4j adapter with chat-memory repair (tested on 1.14.0 and 1.23.0), OpenTelemetry spans and
-> metrics, and the kill, pause and database-fault tests exist; the 0.1.0 artifacts build and sign locally. Maven
-> Central publication waits for the author's key and go-ahead ([`docs/RELEASING.md`](docs/RELEASING.md)). See the
-> verification status below the guarantees and `examples/langchain4j-refund`. Working name — see
+> **Status: 0.1.0 is on Maven Central** (`io.github.oleksii-fenin`, 2026-11-26). Core, the PostgreSQL journal, the
+> reconciler with retention, the operator API, the LangChain4j adapter with chat-memory repair (tested on 1.14.0 and
+> 1.23.0), OpenTelemetry spans and metrics, and the kill, pause and database-fault tests. The artifacts are signed with
+> the key `8D4F33BE3631C885FC1FD4B93B38FDCE92C5089E` ([`docs/RELEASING.md`](docs/RELEASING.md)). See the verification
+> status below the guarantees and `examples/langchain4j-refund`. Working name — see
 > [`docs/OPEN-QUESTIONS.md`](docs/OPEN-QUESTIONS.md).
 
 A small Java library that makes **side-effecting tool calls of AI agents effectively-once**. Your agent's
@@ -136,8 +136,7 @@ call**, one that **pauses** it past its lease, and negative controls proving the
 
 ## Quick start
 
-The artifacts are not on Maven Central yet. Until then, `./gradlew publishToMavenLocal -Pversion=0.1.0` in a clone
-installs them into `~/.m2`; add `mavenLocal()` to the repositories. The BOM keeps the `raa-*` versions in line:
+The artifacts are on Maven Central (`mavenCentral()` in the repositories). The BOM keeps the `raa-*` versions in line:
 
 ```kotlin
 dependencies {
@@ -274,7 +273,7 @@ Checked against public docs on 2026-11-09 (see [`docs/research/`](docs/research)
 | Crash mid side effect | `UNKNOWN` → per-policy resolution, lookup, escalation | retried after timeout; idempotency is on you | block re-run ¹ | step retried; idempotency is on you | retried until success | republished (if configured) |
 | Stale-worker fencing of results | attempt number on every write | not documented ² | not documented ² | not documented ² | not documented ² | not documented ² |
 | Whole workflows, timers, long waits, compensation | **no** | **strong** | **strong** | **strong** | no | no |
-| Maturity | 0.1.0, not published yet | production | production | production (1.x since 07.2026) | mature (7.x) | production |
+| Maturity | 0.1.0 (Maven Central, 11.2026) | production | production | production (1.x since 07.2026) | mature (7.x) | production |
 
 ¹ From a third-party test, not from Restate's docs — unverified. ² Not found in their docs during desk research;
 absence is not proof.

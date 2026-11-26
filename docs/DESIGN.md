@@ -639,7 +639,7 @@ never changes an action.
 | 4 | `raa-langchain4j`: `ReliableToolExecutor`, `ReliableTools.wrap`, `OutcomeRenderer` | contract tests green on LangChain4j 1.14.0 and latest |
 | 5 | `JournalChatMemoryRepair`, `examples/langchain4j-refund`, kill matrix through LangChain4j in both modes | Q1 matrix green end-to-end |
 | 6 | pause test, Toxiproxy faults, `raa-opentelemetry`; GitHub Actions PR + nightly pipelines | all green locally / on CI |
-| 7 | retention, `redact`, overhead measurement, Javadoc, README final; `0.1.0` artifacts built and signed locally | all §9 rows green; publication waits for the author's "ок" |
+| 7 | retention, `redact`, overhead measurement, Javadoc, README final; `0.1.0` artifacts built and signed locally, published on Maven Central (2026-11-26) | all §9 rows green; published files identical to the staging |
 
 Buffer: weeks 8–9 (estimate error ±40 %, ASSUMPTION). v0.2 (≈ +4 weeks): Spring AI adapter, Spring Boot starter, MCP
 server wrapper, strict mode, optional local-transaction mode (journal row and a local DB effect in one transaction),
@@ -768,8 +768,8 @@ server wrapper, strict mode, optional local-transaction mode (journal row and a 
   `implementation`, a module missing from the BOM, no `Automatic-Module-Name`, no POM description, no javadoc jar, no
   SCM `developerConnection`, the PostgreSQL driver `compileOnly` instead of `runtimeOnly`, the snapshot guard removed.
   Not checked: that each mode really resolved from the metadata it names (set in the repository's `metadataSources`),
-  and the README's `publishToMavenLocal` route (`mavenLocal()`), which the job does not use. Not done: the upload to
-  Maven Central.
+  and the README's `publishToMavenLocal` route (`mavenLocal()`), which the job does not use. The upload to Maven
+  Central: see the 2026-11-26 bullet below.
 * Verified on 2026-11-25, locally: signing. `./gradlew publish -Pversion=0.1.0 -Psign
   -Psigning.gnupg.keyName=<id>` signs every published file with the local gpg (`useGpgCmd`). That is 37 `.asc` files,
   one for each jar, POM and module file. `consumer-check` with `-Psigned -PsigningKey=<fingerprint>` verifies each
@@ -779,8 +779,13 @@ server wrapper, strict mode, optional local-transaction mode (journal row and a 
   without `-Psigned`, with the right fingerprint, another one, and none; and a signature copied onto another file.
   Each case gave the expected result. The new step of the CI job `published-artifacts` signs the staging with a
   throwaway key it makes on the runner; it passed on GitHub Actions on 2026-11-26 (run 45875261161, commit 321c26a,
-  the sign tasks executed and the consumer check with `-Psigned` passed). The author's key, the upload and the
-  bundle's acceptance by the Central Portal are not checked; the steps are in `docs/RELEASING.md`.
+  the sign tasks executed and the consumer check with `-Psigned` passed).
+* Verified on 2026-11-26: publication of 0.1.0. Staged and signed with the author's key from commit 8c1d67c (37
+  `.asc`); `consumer-check` with `-Psigned` passed in both resolution modes; the bundle (241 entries) was uploaded
+  through the Portal API as `USER_MANAGED`, validated without errors, and published by the author. Six minutes later
+  all eight POMs answered on repo1.maven.org; each of the 74 published jar, POM, module and `.asc` files is
+  byte-identical (sha256) to the local staging, and the signature of `raa-core-0.1.0.jar` downloaded from there is a
+  good signature of `8D4F33BE3631C885FC1FD4B93B38FDCE92C5089E`. Tag `v0.1.0` points at 8c1d67c.
 * Not yet verified: Q4 (recovery timing) and Q7 (scheduled check against the latest LangChain4j).
 * Verified on 2026-11-23 (after stage D), locally: lease and deadline decisions use database time, not the JVM clock
   (`DatabaseClockSkewTest`, `raa-postgres`; ADR-0008).
@@ -1119,3 +1124,9 @@ the checkout, so it now goes to the home directory, and `*.asc` is ignored by gi
 passed the check, so the check now requires the expected fingerprint and gpg's `GOODSIG`. The tag now names the
 commit that was staged, from a clean tree. The CI step stops on an empty key, and §13 no longer says the step ran on
 a runner.
+
+Revision 23 (2026-11-26, OQ5): 0.1.0 published on Maven Central (§13). The upload went through the Portal's
+publisher API with a user token the author generated and typed in himself, as `USER_MANAGED`, so the deployment
+stopped at `VALIDATED` until the author pressed Publish; the web page's upload, planned in Revision 22, was not used
+because the author was signed in to a second Portal account without the namespace. `docs/RELEASING.md` lists both
+routes. The token never entered the repository, the build or CI.

@@ -1,8 +1,8 @@
 # Releasing to Maven Central
 
 The release is signed and uploaded by the author from his own machine. The signing key stays in his GPG keyring,
-gpg-agent asks for its passphrase, and the upload goes through the Central Portal's web page. Nothing in this
-repository or in CI holds the key, its passphrase or a Portal token (docs/OPEN-QUESTIONS.md OQ5). CI checks the same
+gpg-agent asks for its passphrase, and the upload goes through the Central Portal's web page or its publisher API.
+Nothing in this repository or in CI holds the key, its passphrase or a Portal token (docs/OPEN-QUESTIONS.md OQ5). CI checks the same
 signing setup on every push, with a throwaway key it makes itself (job `published-artifacts`).
 
 Requirements: https://central.sonatype.org/publish/requirements/ and
@@ -80,7 +80,25 @@ step stops the release if it fails.
    For 0.1.0 `unzip` lists 241 entries: 37 files, each with four checksums and a signature (222), and 19 directories.
 5. Upload: on https://central.sonatype.com, open **Publish** and choose **Publish Component**. Give the deployment a
    name, upload `build/central-bundle.zip` and wait for validation. Then press **Publish**. A published version can
-   never be changed or removed.
+   never be changed or removed. Sign in to the Portal account that owns the namespace (**Namespace** shows it as
+   verified); another sign-in method can be another account.
+
+   Or through the publisher API (https://central.sonatype.org/publish/publish-portal-api/, read 2026-11-26; used for
+   0.1.0) with a user token (**View Account**, **Generate User Token**). Keep the token out of files, the shell history
+   and chats, and revoke it afterwards. `USER_MANAGED` stops at `VALIDATED`; publish on the Portal's **Deployments**
+   page after checking the deployment:
+
+   ```bash
+   read -r -p "token username: " tu; read -r -s -p "token password: " tp; echo; auth="Authorization: Bearer $(printf '%s:%s' "$tu" "$tp" | base64 -w0)"; unset tp
+   ```
+
+   ```bash
+   id=$(curl -sS --fail-with-body -H "$auth" --form bundle=@build/central-bundle.zip 'https://central.sonatype.com/api/v1/publisher/upload?name=raa-0.1.0&publishingType=USER_MANAGED') && echo "$id"
+   ```
+
+   ```bash
+   curl -sS --fail-with-body -X POST -H "$auth" "https://central.sonatype.com/api/v1/publisher/status?id=$id" | jq '{deploymentState, purls, errors}'
+   ```
 6. Tag the commit from step 1 and push the tag:
 
    ```bash
