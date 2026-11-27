@@ -51,7 +51,7 @@ All measures are ASSUMPTIONS proposed by the design; they drive tests, not marke
 | Q4 | Recovery | process dies during the effect | dead attempt detected; `RECONCILABLE` resolved | detected **≤ 45 s** (lease 30 s + sweep 15 s); resolved ≤ 45 s + `maxEffectDuration` + lookup |
 | Q5 | Throughput | one PostgreSQL | sustained journaled actions | **≥ 200/s** (4× the estimated peak, 40× the average; not optimized beyond) |
 | Q6 | Availability | journal DB down, unreachable (TCP blackhole), or pool exhausted | effect not started, result to the model within | **≤ 3 s** on the claim path (journal operation timeout 2.5 s, ADR-0006: statement and lock timeouts from the remaining budget, the connection aborted at its end; pool wait and new connections bounded by the documented pool and driver settings); a live-lease poll (`inProgressWait` 2 s) or an inline lookup (`lookupTimeout` 5 s) adds its own bound |
-| Q7 | Upgradability | new LangChain4j minor release | adapter contract tests | pass on floor (1.14.0) and latest, weekly scheduled CI |
+| Q7 | Upgradability | new LangChain4j minor release | adapter contract tests | pass on floor (1.14.0) and latest, and nightly on the newest release on Maven Central |
 
 Priority: Q1, Q1p, Q2 (the thesis) > Q6 > Q4 > Q3 > Q7 > Q5.
 
@@ -566,11 +566,13 @@ applied. **Negative controls** (must fail, proving the harness sees duplicates):
 
 CI (`ci.yml`, every push and PR): unit, SQL interleavings, deterministic kill matrix (4 policies × 4 points, both
 modes through the example) plus negative controls, the pause test, the two-JVM Q2 and the database fault tests, on Java
-17/21/25 × PostgreSQL 18, PostgreSQL 14 on Java 25, LangChain4j floor (1.14.0, Java 17 job) and latest. Nightly
+17/21/25 × PostgreSQL 18, PostgreSQL 14 on Java 25, LangChain4j floor (1.14.0, Java 17 job) and latest (the version
+in `gradle/libs.versions.toml`). Nightly
 (`nightly.yml`, 02:17 UTC and on demand): the same matrix through `workflow_call` with `--rerun-tasks` (a push may take
 test results from the Gradle build cache; the first nightly run did so in one job and re-checked nothing there), so
 drift shows up without a push,
-and the randomized kill, 500 runs per policy in four parallel jobs.
+the adapter and example tests on the newest LangChain4j release on Maven Central (Q7; a notice when it is newer
+than the catalog), and the randomized kill, 500 runs per policy in four parallel jobs.
 
 **Randomized kill.** The child warms up (a call of another action, one lookup request), prints `RAA-CALLING`, and
 makes the call; the parent kills it after a delay drawn uniformly from 0 to 1.5 times the median duration of three
@@ -655,7 +657,7 @@ server wrapper, strict mode, optional local-transaction mode (journal row and a 
 | Wrong keys or free-text declarations by users | false replays or duplicates | mandatory explicit strategy and scope, conflict check on material arguments, docs with patterns |
 | Personal data in results/keys | compliance issue for adopters | keys and arguments hashed by default, retention, `redact`, hashed span attributes |
 | Async-replica deployments | silent duplicates after failover | documented durability requirement; startup warning if `synchronous_commit` is off (check feasibility in week 2) |
-| Framework API churn | adapter breaks | public APIs only, floor+latest CI matrix, weekly scheduled build |
+| Framework API churn | adapter breaks | public APIs only, floor+latest CI matrix, nightly build on the newest release |
 | Schedule (8–12 h/week) | v0.1 slips | stage gates; week 3 alone is a demonstrable result |
 
 ## 13. Verified vs argued (as of 2026-11-23)
@@ -792,7 +794,8 @@ server wrapper, strict mode, optional local-transaction mode (journal row and a 
   default, JDK-proxy and class-based-proxy tools (`ToolBeanScannerTest`; 6 cases skipped on 1.14.0 by design). Seven
   hand-run mutations of the scan (no superclasses, no interface defaults, no supertype lookup, no argument-exception
   wrapping, no exception propagation, no override deduplication, no class check) each fail at least one test.
-* Not yet verified: Q4 (recovery timing) and Q7 (scheduled check against the latest LangChain4j).
+* Not yet verified: Q4 (recovery timing). Q7: the nightly job on the newest LangChain4j release was added on
+  2026-11-27 (Revision 25) and has not run on CI yet; locally its steps found 1.24.1 and the tests passed on it.
 * Verified on 2026-11-23 (after stage D), locally: lease and deadline decisions use database time, not the JVM clock
   (`DatabaseClockSkewTest`, `raa-postgres`; ADR-0008).
   * Harness: in a database of its own, `clock_timestamp()` is a function in the schema `raa_test_clock` that adds the
@@ -1143,3 +1146,9 @@ package-private `ToolBeanScanner` finds the tools with public API only, followin
 later on every supported version; on 1.14 to 1.19 it can find more tools than `AiServices.tools(bean)`, and each of
 them needs a policy. LangChain4j's `@P` wiring check (1.15+) no longer runs for wrapped beans; a bad default fails
 the call before the tool runs. Tests keep `findTools` as an oracle (§13).
+
+Revision 25 (2026-11-27, Q7): `langchain4j-latest` moves from 1.23.0 to 1.24.1, the newest release on Maven Central
+(`./gradlew build` green on it: adapter 68 tests, example 34). The nightly workflow gets a job "newest LangChain4j"
+that reads `maven-metadata.xml` of `dev.langchain4j:langchain4j`, takes the highest x.y.z release, and runs the
+adapter and example tests on it with `-Plangchain4jVersion` (`LangChain4jContractTest` checks the jar that ran); it
+writes a notice when that release is newer than the catalog. Q7 counts as verified after its first green run on CI.

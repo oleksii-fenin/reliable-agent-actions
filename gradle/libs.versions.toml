@@ -7,10 +7,11 @@ testcontainers = "2.0.5"
 hikaricp = "7.1.0"
 # OpenTelemetry Java API for raa-opentelemetry; latest release checked 2026-11-19 (Maven Central, 1.68.0 of 2026-11-06).
 opentelemetry = "1.68.0"
-# Floor of the supported range (ADR-0002: findTools + tools(List<AiServiceTool>)); the adapter compiles against it.
+# Floor of the supported range (ADR-0002: tools(List<AiServiceTool>)); the adapter compiles against it.
 langchain4j-floor = "1.14.0"
-# Latest release checked 2026-11-16 (Maven Central); the default for the adapter tests.
-langchain4j-latest = "1.23.0"
+# Latest release checked 2026-11-27 (Maven Central); the default for the adapter tests. The nightly job "newest
+# LangChain4j" tests the newest release on Maven Central, so a release newer than this one shows up there.
+langchain4j-latest = "1.24.1"
 
 [libraries]
 junit-bom = { module = "org.junit:junit-bom", version.ref = "junit" }

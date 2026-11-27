@@ -1,8 +1,9 @@
 name: Nightly
 
-# docs/DESIGN.md §9: the randomized process kill (500 runs per policy) and the full build matrix of ci.yml, also when
-# nothing was pushed, so that drift in dependencies or runners shows up. The pause test and the database fault tests
-# run in every build already (ci.yml). GitHub disables scheduled workflows after 60 days without repository activity.
+# docs/DESIGN.md §9: the randomized process kill (500 runs per policy), the full build matrix of ci.yml and the adapter
+# tests on the newest LangChain4j release (Q7), also when nothing was pushed, so that drift in dependencies, runners
+# or LangChain4j shows up. The pause test and the database fault tests run in every build already (ci.yml). GitHub
+# disables scheduled workflows after 60 days without repository activity.
 on:
   schedule:
     - cron: '17 2 * * *' # 02:17 UTC
@@ -21,6 +22,47 @@ jobs:
     uses: ./.github/workflows/ci.yml
     with:
       rerun-tests: true
+
+  newest-langchain4j:
+    # Q7 (docs/DESIGN.md §2): the adapter and the example on the newest LangChain4j release on Maven Central, not the
+    # one in gradle/libs.versions.toml, so a new release is tested the night after it appears.
+    name: newest LangChain4j (adapter and example)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+      - uses: gradle/actions/setup-gradle@v5
+      - name: Find the newest release
+        run: |
+          set -euo pipefail
+          # Releases only (x.y.z); the metadata also lists old alphas, betas and release candidates.
+          newest=$(curl -sSf --retry 3 https://repo1.maven.org/maven2/dev/langchain4j/langchain4j/maven-metadata.xml \
+            | grep -o '<version>[0-9]*\.[0-9]*\.[0-9]*</version>' | sed 's/<[^>]*>//g' | sort -V | tail -1)
+          [[ "$newest" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "no release version found: '$newest'"; exit 1; }
+          catalog=$(sed -n 's/^langchain4j-latest = "\(.*\)"$/\1/p' gradle/libs.versions.toml)
+          echo "LANGCHAIN4J_NEWEST=$newest" >> "$GITHUB_ENV"
+          echo "Newest LangChain4j release: $newest (gradle/libs.versions.toml: $catalog)" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$newest" != "$catalog" ]; then
+            echo "::notice::LangChain4j $newest is newer than langchain4j-latest $catalog in gradle/libs.versions.toml"
+          fi
+      - name: Adapter and example tests
+        # LangChain4jContractTest checks that the tests ran on the requested version's jar.
+        run: >
+          ./gradlew :raa-langchain4j:test :examples:langchain4j-refund:test
+          -Plangchain4jVersion="$LANGCHAIN4J_NEWEST" --rerun-tasks
+          -Porg.gradle.java.installations.auto-download=false
+      - name: Upload the test reports
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: newest-langchain4j
+          path: |
+            raa-langchain4j/build/reports/tests/test
+            examples/langchain4j-refund/build/reports/tests/test
 
   randomized-kill:
     name: randomized kill (${{ matrix.policy }})

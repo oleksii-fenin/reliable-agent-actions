@@ -2,10 +2,10 @@
 
 > **Status: 0.1.0 is on Maven Central** (`io.github.oleksii-fenin`, 2026-11-26). Core, the PostgreSQL journal, the
 > reconciler with retention, the operator API, the LangChain4j adapter with chat-memory repair (tested on 1.14.0 and
-> 1.23.0), OpenTelemetry spans and metrics, and the kill, pause and database-fault tests. The artifacts are signed with
-> the key `8D4F33BE3631C885FC1FD4B93B38FDCE92C5089E` ([`docs/RELEASING.md`](docs/RELEASING.md)). See the verification
-> status below the guarantees and `examples/langchain4j-refund`. Working name — see
-> [`docs/OPEN-QUESTIONS.md`](docs/OPEN-QUESTIONS.md).
+> 1.24.1, and nightly on the newest release), OpenTelemetry spans and metrics, and the kill, pause and database-fault
+> tests. The artifacts are signed with the key `8D4F33BE3631C885FC1FD4B93B38FDCE92C5089E`
+> ([`docs/RELEASING.md`](docs/RELEASING.md)). See the verification status below the guarantees and
+> `examples/langchain4j-refund`. Working name — see [`docs/OPEN-QUESTIONS.md`](docs/OPEN-QUESTIONS.md).
 
 A small Java library that makes **side-effecting tool calls of AI agents effectively-once**. Your agent's
 "refund the order", "send the e-mail", "create the ticket" takes effect **once per logical action** — when the external
@@ -72,7 +72,7 @@ call**, one that **pauses** it past its lease, and negative controls proving the
   deadlines and escalation (runner, reconciler and decision-table tests). The lease and deadline decisions stay the
   same with the database clock an hour ahead of the JVM clock or an hour behind it.
 * **Verified — LangChain4j adapter** through a real `AiServices` with a scripted model, on LangChain4j 1.14.0 and
-  1.23.0: a tool runs once, a regenerated call or a call after lost memory gets the recorded result, a crash during the
+  1.24.1: a tool runs once, a regenerated call or a call after lost memory gets the recorded result, a crash during the
   tool is retried with the same idempotency key, concurrent same-key calls run the tool once, invalid arguments and a
   missing `@MemoryId` are "not performed"; specifications and `ReturnBehavior` are kept, `IMMEDIATE` is rejected.
 * **Verified — end to end through LangChain4j** (`examples/langchain4j-refund`): the refund agent, with its chat memory
